@@ -44,10 +44,7 @@ impl PlanV2 {
         }
     }
 
-    pub(crate) fn task_context<A>(
-        &self,
-        mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
-    ) -> Arc<TaskContext<A>> {
+    pub(crate) fn task_context(&self) -> Arc<TaskContext> {
         Arc::new(TaskContext {
             filter: self
                 .filter
@@ -55,8 +52,11 @@ impl PlanV2 {
                 .map(|filter| Arc::new(FilterExpr::new(filter))),
             predicates: self.predicates.clone(),
             projection: Arc::clone(&self.projection),
-            mapper,
         })
+    }
+
+    pub(crate) fn has_filter(&self) -> bool {
+        self.filter.is_some()
     }
 }
 
@@ -212,11 +212,11 @@ fn parse_scan_impl(value: &str) -> VortexResult<bool> {
 /// The execution order intentionally mirrors [`crate::scan::plan::split_exec`]. Expressions were
 /// consumed during planning, so execution selects a predicate or projection plan without passing
 /// an expression.
-pub(crate) fn split_exec<A: 'static + Send>(
-    ctx: Arc<TaskContext<A>>,
+pub(crate) fn split_exec(
+    ctx: Arc<TaskContext>,
     read_mask: RowMask,
     limit: Option<&mut u64>,
-) -> VortexResult<BoxFuture<'static, VortexResult<Option<A>>>> {
+) -> VortexResult<BoxFuture<'static, VortexResult<Option<ArrayRef>>>> {
     let row_range = read_mask.row_range();
     let row_mask = read_mask.mask().clone();
 
@@ -304,26 +304,23 @@ pub(crate) fn split_exec<A: 'static + Send>(
         .projection
         .projection_evaluation(&row_range, filter_mask.clone())?;
 
-    let mapper = Arc::clone(&ctx.mapper);
     let array_fut = async move {
         let mask = filter_mask.await?;
         if mask.all_false() {
             return Ok(None);
         }
 
-        let array = projection_future.await?;
-        mapper(array).map(Some)
+        projection_future.await.map(Some)
     };
 
     Ok(array_fut.boxed())
 }
 
 /// Information needed to execute one split from a V2 physical scan plan.
-pub(crate) struct TaskContext<A> {
+pub(crate) struct TaskContext {
     filter: Option<Arc<FilterExpr>>,
     predicates: Vec<ScanPlanRef>,
     projection: ScanPlanRef,
-    mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
 }
 
 #[cfg(test)]

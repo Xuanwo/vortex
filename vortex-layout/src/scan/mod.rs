@@ -4,6 +4,7 @@
 pub mod arrow;
 mod filter;
 pub mod layout;
+mod limit;
 pub mod multi;
 mod plan;
 pub mod plan_v2;
