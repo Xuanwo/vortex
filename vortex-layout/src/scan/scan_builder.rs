@@ -44,7 +44,7 @@ use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
 
-/// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
+/// Builder for scanning a [`LayoutReader`] into arrays, streams, or iterators.
 ///
 /// A scan has three independent row restriction mechanisms:
 ///
@@ -72,7 +72,7 @@ pub struct ScanBuilder {
     /// The number of splits to make progress on concurrently **per-thread**.
     concurrency: usize,
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
-    /// Maximal number of rows to read (after filtering)
+    /// Maximal number of rows to read after filtering.
     limit: Option<u64>,
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
@@ -741,13 +741,14 @@ mod test {
         fn register_splits(
             &self,
             _field_mask: &[FieldMask],
-            row_range: &Range<u64>,
-            splits: &mut BTreeSet<u64>,
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
         ) -> VortexResult<()> {
+            let row_range = split_range.row_range();
             for split in ((row_range.start + 2)..row_range.end).step_by(2) {
-                splits.insert(split);
+                splits.push(split_range.row_offset() + split);
             }
-            splits.insert(row_range.end);
+            splits.push(split_range.root_row_range().end);
             Ok(())
         }
 
@@ -808,10 +809,10 @@ mod test {
     where
         I: IntoIterator<Item = VortexResult<ArrayRef>>,
     {
+        let mut ctx = array_session().create_execution_ctx();
         let mut values = Vec::new();
         for chunk in iter {
-            #[expect(deprecated)]
-            let primitive = chunk?.to_primitive();
+            let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
             values.extend(primitive.into_buffer::<i32>());
         }
         Ok(values)
@@ -835,7 +836,7 @@ mod test {
     #[test]
     fn into_stream_limits_filtered_results() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
-        let session = crate::scan::test::session_with_handle(runtime.handle());
+        let session = session_with_handle(runtime.handle());
         let reader = Arc::new(FilteringLayoutReader::new(8, |_| true));
 
         let stream = ScanBuilder::new(session, reader)
@@ -852,7 +853,7 @@ mod test {
     #[test]
     fn prepared_scan_limits_filtered_results() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
-        let session = crate::scan::test::session_with_handle(runtime.handle());
+        let session = session_with_handle(runtime.handle());
         let reader = Arc::new(FilteringLayoutReader::new(8, |row| row % 2 == 1));
 
         let scan = ScanBuilder::new(session, reader)

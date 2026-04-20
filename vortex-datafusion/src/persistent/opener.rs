@@ -431,9 +431,10 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_concurrency(concurrency);
             }
 
-            let handle = session.handle();
             let stream_target_field =
                 Arc::new(Field::new_struct("", stream_schema.fields().clone(), false));
+            let handle = session.handle();
+            let file_location = file.object_meta.location.clone();
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -441,7 +442,7 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
-                .then(move |chunk| {
+                .map(move |chunk| {
                     let session = session.clone();
                     let stream_target_field = Arc::clone(&stream_target_field);
                     let handle = handle.clone();
@@ -458,12 +459,8 @@ impl FileOpener for VortexOpener {
                         })
                     })
                 })
-                .map_err(move |e: VortexError| {
-                    DataFusionError::External(Box::new(e.with_context(format!(
-                        "Failed to read Vortex file: {}",
-                        file.object_meta.location
-                    ))))
-                })
+                .buffered(2)
+                .map_err(move |e: VortexError| vortex_file_read_error(&file_location, e))
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
                         batch
@@ -582,6 +579,12 @@ fn split_midpoint_to_byte(split_range: &Range<u64>, row_count: u64, total_size: 
     u64::try_from(midpoint_byte).vortex_expect("midpoint byte projection should fit into u64")
 }
 
+fn vortex_file_read_error(path: &Path, error: VortexError) -> DataFusionError {
+    DataFusionError::External(Box::new(
+        error.with_context(format!("Failed to read Vortex file: {path}")),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -614,6 +617,7 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
     use datafusion_physical_expr::projection::ProjectionExpr;
+    use futures::TryStreamExt;
     use insta::assert_snapshot;
     use itertools::Itertools;
     use object_store::ObjectStore;

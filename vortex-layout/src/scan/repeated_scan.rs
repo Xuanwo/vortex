@@ -49,7 +49,7 @@ pub struct RepeatedScan {
     splits: Splits,
     /// The number of splits to make progress on concurrently **per-thread**.
     concurrency: usize,
-    /// Maximal number of rows to read (after filtering)
+    /// Maximal number of rows to read (after filtering).
     limit: Option<u64>,
     /// The dtype of the projected arrays.
     dtype: DType,
@@ -118,6 +118,7 @@ impl RepeatedScan {
         let stream = self.execute_stream(row_range)?;
         Ok(ArrayStreamAdapter::new(dtype, stream))
     }
+
     /// Constructor just to allow `scan_builder` to create a `RepeatedScan`.
     #[expect(
         clippy::too_many_arguments,
@@ -245,15 +246,19 @@ impl RepeatedScan {
         let ctx = self.execution.task_context();
 
         for range in self.split_ranges(row_range) {
+            if range.start >= range.end {
+                continue;
+            }
+            if limit.is_some_and(|l| l == 0) {
+                break;
+            }
+
             let row_mask = self.selection.row_mask(&range);
             if row_mask.mask().all_false() {
                 continue;
             }
 
             tasks.push(ctx.split_exec(row_mask, limit.as_mut())?);
-            if limit.is_some_and(|l| l == 0) {
-                break;
-            }
         }
 
         Ok(tasks)
