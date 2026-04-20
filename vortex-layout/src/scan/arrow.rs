@@ -18,7 +18,6 @@ use vortex_array::VortexSessionExecute;
 use vortex_arrow::ArrowSessionExt;
 use vortex_error::VortexResult;
 use vortex_io::runtime::BlockingRuntime;
-use vortex_io::session::RuntimeSessionExt;
 
 use crate::scan::scan_builder::ScanBuilder;
 
@@ -53,10 +52,6 @@ impl ScanBuilder {
     ) -> VortexResult<impl Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static> {
         let struct_field = Arc::new(Field::new_struct("", schema.fields().clone(), false));
         let session = self.session().clone();
-        let handle = session.handle();
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
 
         let stream = self
             .into_stream()?
@@ -75,7 +70,6 @@ impl ScanBuilder {
                         .await
                 }
             })
-            .buffered(concurrency)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
         Ok(stream)
