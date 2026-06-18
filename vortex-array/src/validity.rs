@@ -33,7 +33,6 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::legacy_session;
-use crate::optimizer::ArrayOptimizer;
 use crate::patches::Patches;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::binary::Binary;
@@ -321,11 +320,10 @@ impl Validity {
             | (Validity::AllValid, Validity::NonNullable)
             | (Validity::AllValid, Validity::AllValid) => Validity::AllValid,
             // Here we actually have to do some work
-            (Validity::Array(lhs), Validity::Array(rhs)) => Validity::Array(
-                Binary
-                    .try_new_array(lhs.len(), Operator::And, [lhs, rhs])?
-                    .optimize()?,
-            ),
+            (Validity::Array(lhs), Validity::Array(rhs)) => {
+                let parts = Binary.try_new_array_parts(lhs.len(), Operator::And, [lhs, rhs])?;
+                Validity::Array(parts.optimize()?)
+            }
         })
     }
 

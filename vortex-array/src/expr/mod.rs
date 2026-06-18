@@ -74,6 +74,7 @@ pub use bound_expression::*;
 pub use expression::*;
 pub use exprs::*;
 pub use scope::*;
+pub use optimize::ExpressionReduceNode;
 
 pub trait VortexExprExt {
     /// Accumulate all field references from this expression and its children in a set
