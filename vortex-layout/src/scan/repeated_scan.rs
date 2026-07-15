@@ -89,7 +89,7 @@ impl ExecutionTaskContext {
         &self,
         row_mask: vortex_scan::row_mask::RowMask,
         limit: Option<&mut u64>,
-    ) -> VortexResult<plan::TaskFuture<Option<ArrayRef>>> {
+    ) -> VortexResult<plan::TaskFuture> {
         match self {
             Self::Plan(ctx) => plan::split_exec(Arc::clone(ctx), row_mask, limit),
             Self::PlanV2(ctx) => plan_v2::split_exec(Arc::clone(ctx), row_mask, limit),
@@ -243,7 +243,7 @@ impl RepeatedScan {
     pub(crate) fn execute(
         &self,
         row_range: Option<Range<u64>>,
-    ) -> VortexResult<Vec<plan::TaskFuture<Option<ArrayRef>>>> {
+    ) -> VortexResult<Vec<plan::TaskFuture>> {
         let mut limit = self.limit.filter(|_| !self.execution.has_filter());
         let mut tasks = Vec::new();
         let ctx = self.execution.task_context();
