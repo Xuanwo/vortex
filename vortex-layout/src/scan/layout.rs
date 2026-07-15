@@ -335,6 +335,8 @@ impl Partition for LayoutReaderSplit {
         // Use into_stream() which creates a LazyScanStream that spawns individual I/O
         // tasks onto the runtime, enabling parallel execution across executor threads.
         let stream = builder.into_stream()?.boxed();
+        // Caps total rows across all partitions; only correct for unordered consumption
+        // (see `SharedRowLimit`).
         let stream = match shared_limit {
             Some(limit) => LimitedStream::new(stream, RowBudget::Shared(limit)).boxed(),
             None => stream,

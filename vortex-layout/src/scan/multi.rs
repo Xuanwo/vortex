@@ -543,6 +543,8 @@ impl Partition for MultiLayoutPartition {
 
         let dtype = builder.dtype()?;
         let stream = builder.into_stream()?.boxed();
+        // Caps total rows across all partitions; only correct for unordered consumption
+        // (see `SharedRowLimit`).
         let stream = match shared_limit {
             Some(limit) => LimitedStream::new(stream, RowBudget::Shared(limit)).boxed(),
             None => stream,

@@ -16,12 +16,12 @@ use vortex_array::ArrayRef;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-/// A row limit shared by streams that execute independent scan partitions.
+/// A row limit shared by the streams executing one scan's independent partitions.
 ///
-/// The shared budget gives "at most `limit` rows in total" semantics without any ordering
-/// guarantee across the streams that share it: whichever stream produces a chunk first claims
-/// the budget first. It is therefore only correct for consumers that treat the combined output
-/// as unordered (e.g. a bare `LIMIT n`), not for order-preserving cross-partition consumption.
+/// The single budget is claimed in completion order, not row order, so the combined output is
+/// "any `limit` rows", not "the first `limit` in scan order": under concurrency a later partition
+/// can drain the budget and starve an earlier one. Only sound for unordered consumers (a bare
+/// `LIMIT n`); order-preserving consumers must use a per-partition `ScanBuilder::with_limit`.
 #[derive(Clone)]
 pub(crate) struct SharedRowLimit(Arc<AtomicU64>);
 
