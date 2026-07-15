@@ -316,6 +316,9 @@ impl ScanBuilder {
     }
 
     /// Returns a [`Stream`] with tasks spawned onto the session's runtime handle.
+    ///
+    /// Preparation and initial stream construction begin on the first poll. Errors from either
+    /// step are returned as the stream's next item.
     pub fn into_stream(
         self,
     ) -> VortexResult<impl Stream<Item = VortexResult<ArrayRef>> + Send + 'static> {
@@ -366,6 +369,11 @@ impl Stream for LazyScanStream {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
                     let handle = builder.session.handle();
+                    // IMPORTANT: Building the stream can synchronously walk the layout and
+                    // register I/O for every split. Keep it with preparation in this CPU
+                    // task: poll_next must only wait for and poll an already-constructed stream.
+                    // This also keeps construction errors on the Preparing -> Error path rather
+                    // than running construction on the caller's executor.
                     let task = handle.spawn_cpu(move || {
                         let scan = builder.prepare()?;
                         Ok(scan.execute_stream(None)?.boxed())
@@ -441,6 +449,7 @@ mod test {
     use vortex_error::vortex_err;
     use vortex_io::runtime::BlockingRuntime;
     use vortex_io::runtime::single::SingleThreadRuntime;
+    use vortex_io::runtime::tokio::TokioRuntime;
     use vortex_mask::Mask;
 
     use super::ScanBuilder;
@@ -601,6 +610,13 @@ mod test {
         dtype: DType,
         row_count: u64,
         register_splits_calls: Arc<AtomicUsize>,
+        blocking_projection: Option<BlockingProjection>,
+    }
+
+    #[derive(Debug)]
+    struct BlockingProjection {
+        started: mpsc::Sender<()>,
+        gate: Arc<Mutex<()>>,
     }
 
     impl SplittingLayoutReader {
@@ -610,7 +626,18 @@ mod test {
                 dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
                 row_count: 4,
                 register_splits_calls,
+                blocking_projection: None,
             }
+        }
+
+        fn with_blocking_projection(
+            register_splits_calls: Arc<AtomicUsize>,
+            gate: Arc<Mutex<()>>,
+            started: mpsc::Sender<()>,
+        ) -> Self {
+            let mut reader = Self::new(register_splits_calls);
+            reader.blocking_projection = Some(BlockingProjection { started, gate });
+            reader
         }
     }
 
@@ -664,6 +691,14 @@ mod test {
             _expr: &Expression,
             _mask: MaskFuture,
         ) -> VortexResult<ArrayFuture> {
+            if let Some(blocking_projection) = &self.blocking_projection {
+                blocking_projection
+                    .started
+                    .send(())
+                    .map_err(|_| vortex_err!("test projection-start receiver dropped"))?;
+                let _guard = blocking_projection.gate.lock();
+            }
+
             let start = usize::try_from(row_range.start)
                 .map_err(|_| vortex_err!("row_range.start must fit in usize"))?;
             let end = usize::try_from(row_range.end)
@@ -702,6 +737,69 @@ mod test {
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(values.as_ref(), [0, 1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn into_stream_constructs_tasks_off_the_poller() -> VortexResult<()> {
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_send, started_recv) = mpsc::channel();
+        let reader = Arc::new(SplittingLayoutReader::with_blocking_projection(
+            Arc::clone(&calls),
+            Arc::clone(&gate),
+            started_send,
+        ));
+
+        let runtime = TokioRuntime::new(tokio::runtime::Handle::current());
+        let session = session_with_handle(runtime.handle());
+        let mut stream = ScanBuilder::new(session, reader).into_stream()?;
+
+        let (poll_send, poll_recv) = mpsc::channel();
+        let (release_send, release_recv) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let waker = noop_waker_ref();
+            let mut cx = Context::from_waker(waker);
+            let poll = Pin::new(&mut stream).poll_next(&mut cx);
+            let _ = poll_send.send(matches!(poll, Poll::Pending));
+            let _ = release_recv.recv();
+        });
+
+        let poll_result = poll_recv.recv_timeout(Duration::from_secs(1));
+        let projection_started = started_recv.recv_timeout(Duration::from_secs(1));
+
+        // Release the task and join its caller before reporting a failed assertion.
+        drop(guard);
+        let _ = release_send.send(());
+        drop(join.join());
+
+        assert!(
+            poll_result.is_ok_and(|poll_pending| poll_pending),
+            "first poll must return while scan task construction is blocked"
+        );
+        projection_started
+            .map_err(|_| vortex_err!("stream construction did not begin in the background"))?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn into_stream_reports_stream_construction_errors() -> VortexResult<()> {
+        let range_start = i32::MAX as u64 + 1;
+        let reader = Arc::new(SplittingLayoutReader::new(Arc::new(AtomicUsize::new(0))));
+        let session = session_with_handle(TokioRuntime::current());
+        let mut stream = ScanBuilder::new(session, reader)
+            .with_row_range(range_start..range_start + 1)
+            .into_stream()?;
+
+        assert!(matches!(
+            futures::StreamExt::next(&mut stream).await,
+            Some(Err(_))
+        ));
+        assert!(futures::StreamExt::next(&mut stream).await.is_none());
 
         Ok(())
     }
