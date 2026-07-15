@@ -40,8 +40,9 @@ use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
 use crate::LayoutReaderRef;
+use crate::scan::limit::LimitedStream;
+use crate::scan::limit::RowBudget;
 use crate::scan::limit::SharedRowLimit;
-use crate::scan::limit::limit_array_stream_shared;
 use crate::scan::scan_builder::ScanBuilder;
 
 /// An implementation of a [`DataSource`] that reads data from a [`LayoutReaderRef`].
@@ -333,7 +334,11 @@ impl Partition for LayoutReaderSplit {
         let dtype = builder.dtype()?;
         // Use into_stream() which creates a LazyScanStream that spawns individual I/O
         // tasks onto the runtime, enabling parallel execution across executor threads.
-        let stream = limit_array_stream_shared(builder.into_stream()?, shared_limit);
+        let stream = builder.into_stream()?.boxed();
+        let stream = match shared_limit {
+            Some(limit) => LimitedStream::new(stream, RowBudget::Shared(limit)).boxed(),
+            None => stream,
+        };
 
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,

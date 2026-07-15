@@ -13,22 +13,15 @@ use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
 use vortex_array::ArrayRef;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-pub(crate) fn limit_array_stream<S>(
-    stream: S,
-    limit: Option<u64>,
-) -> BoxStream<'static, VortexResult<ArrayRef>>
-where
-    S: Stream<Item = VortexResult<ArrayRef>> + Send + 'static,
-{
-    match limit {
-        Some(limit) => RowLimitedStream::new(stream.boxed(), limit).boxed(),
-        None => stream.boxed(),
-    }
-}
-
 /// A row limit shared by streams that execute independent scan partitions.
+///
+/// The shared budget gives "at most `limit` rows in total" semantics without any ordering
+/// guarantee across the streams that share it: whichever stream produces a chunk first claims
+/// the budget first. It is therefore only correct for consumers that treat the combined output
+/// as unordered (e.g. a bare `LIMIT n`), not for order-preserving cross-partition consumption.
 #[derive(Clone)]
 pub(crate) struct SharedRowLimit(Arc<AtomicU64>);
 
@@ -52,99 +45,87 @@ impl SharedRowLimit {
             }
         }
     }
-}
 
-pub(crate) fn limit_array_stream_shared<S>(
-    stream: S,
-    limit: Option<SharedRowLimit>,
-) -> BoxStream<'static, VortexResult<ArrayRef>>
-where
-    S: Stream<Item = VortexResult<ArrayRef>> + Send + 'static,
-{
-    match limit {
-        Some(limit) => SharedRowLimitedStream::new(stream.boxed(), limit).boxed(),
-        None => stream.boxed(),
+    fn is_exhausted(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == 0
     }
 }
 
-struct RowLimitedStream {
+/// The remaining rows a [`LimitedStream`] may emit, either privately or shared across streams.
+pub(crate) enum RowBudget {
+    /// A budget private to a single stream.
+    Local(u64),
+    /// A budget shared across streams executing independent scan partitions.
+    Shared(SharedRowLimit),
+}
+
+impl RowBudget {
+    /// Reserve up to `requested` rows from the budget.
+    ///
+    /// Returns `(reserved, exhausted)` where `reserved <= requested` and `exhausted` is true
+    /// once the budget has reached zero.
+    fn reserve(&mut self, requested: u64) -> (u64, bool) {
+        match self {
+            RowBudget::Local(remaining) => {
+                let reserved = (*remaining).min(requested);
+                *remaining -= reserved;
+                (reserved, *remaining == 0)
+            }
+            RowBudget::Shared(shared) => shared.reserve(requested),
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        match self {
+            RowBudget::Local(remaining) => *remaining == 0,
+            RowBudget::Shared(shared) => shared.is_exhausted(),
+        }
+    }
+}
+
+/// Wraps a stream, emitting chunks until its [`RowBudget`] is exhausted, then terminating.
+pub(crate) struct LimitedStream {
     inner: BoxStream<'static, VortexResult<ArrayRef>>,
-    remaining: u64,
+    budget: RowBudget,
 }
 
-impl RowLimitedStream {
-    fn new(inner: BoxStream<'static, VortexResult<ArrayRef>>, remaining: u64) -> Self {
-        Self { inner, remaining }
+impl LimitedStream {
+    pub(crate) fn new(
+        inner: BoxStream<'static, VortexResult<ArrayRef>>,
+        budget: RowBudget,
+    ) -> Self {
+        Self { inner, budget }
     }
 
+    /// Drop the inner stream so no further work (including spawned split tasks) is polled.
     fn abort_pending(&mut self) {
-        let inner = std::mem::replace(&mut self.inner, stream::empty().boxed());
-        drop(inner);
+        self.inner = stream::empty().boxed();
     }
 }
 
-impl Stream for RowLimitedStream {
+impl Stream for LimitedStream {
     type Item = VortexResult<ArrayRef>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.remaining == 0 {
+        // Avoid reading a chunk we have no budget for. For a shared budget this also stops a
+        // partition whose siblings already consumed the limit.
+        if self.budget.is_exhausted() {
+            self.abort_pending();
             return Poll::Ready(None);
         }
 
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let chunk_len = chunk.len() as u64;
-                if chunk_len <= self.remaining {
-                    self.remaining -= chunk_len;
-                    if self.remaining == 0 {
-                        self.abort_pending();
-                    }
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    let limit = match usize::try_from(self.remaining) {
-                        Ok(limit) => limit,
-                        Err(_) => unreachable!("remaining rows cannot exceed the current chunk"),
-                    };
-                    self.remaining = 0;
-                    self.abort_pending();
-                    Poll::Ready(Some(chunk.slice(0..limit)))
-                }
-            }
-            other => other,
-        }
-    }
-}
-
-struct SharedRowLimitedStream {
-    inner: BoxStream<'static, VortexResult<ArrayRef>>,
-    limit: SharedRowLimit,
-}
-
-impl SharedRowLimitedStream {
-    fn new(inner: BoxStream<'static, VortexResult<ArrayRef>>, limit: SharedRowLimit) -> Self {
-        Self { inner, limit }
-    }
-
-    fn abort_pending(&mut self) {
-        let inner = std::mem::replace(&mut self.inner, stream::empty().boxed());
-        drop(inner);
-    }
-}
-
-impl Stream for SharedRowLimitedStream {
-    type Item = VortexResult<ArrayRef>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                let chunk_len = chunk.len() as u64;
-                let (reserved, exhausted) = self.limit.reserve(chunk_len);
+                let (reserved, exhausted) = self.budget.reserve(chunk_len);
 
                 if exhausted {
                     self.abort_pending();
                 }
 
                 if reserved == 0 {
+                    // Either the budget was already exhausted (stop), or this is an empty chunk
+                    // while the budget still has room (pass it through).
                     if exhausted {
                         Poll::Ready(None)
                     } else {
@@ -153,11 +134,8 @@ impl Stream for SharedRowLimitedStream {
                 } else if reserved == chunk_len {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
-                    let limit = match usize::try_from(reserved) {
-                        Ok(limit) => limit,
-                        Err(_) => unreachable!("reserved rows cannot exceed the current chunk"),
-                    };
-                    self.abort_pending();
+                    let limit = usize::try_from(reserved)
+                        .vortex_expect("reserved rows are bounded by the chunk length");
                     Poll::Ready(Some(chunk.slice(0..limit)))
                 }
             }

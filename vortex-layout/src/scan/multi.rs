@@ -57,8 +57,9 @@ use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
+use crate::scan::limit::LimitedStream;
+use crate::scan::limit::RowBudget;
 use crate::scan::limit::SharedRowLimit;
-use crate::scan::limit::limit_array_stream_shared;
 use crate::scan::scan_builder::ScanBuilder;
 
 /// Default concurrency for opening deferred readers.
@@ -541,7 +542,11 @@ impl Partition for MultiLayoutPartition {
         }
 
         let dtype = builder.dtype()?;
-        let stream = limit_array_stream_shared(builder.into_stream()?, shared_limit);
+        let stream = builder.into_stream()?.boxed();
+        let stream = match shared_limit {
+            Some(limit) => LimitedStream::new(stream, RowBudget::Shared(limit)).boxed(),
+            None => stream,
+        };
 
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,
