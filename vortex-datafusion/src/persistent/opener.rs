@@ -421,9 +421,7 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?;
 
-            if let Some(limit) = limit
-                && filter.is_none()
-            {
+            if let Some(limit) = limit {
                 scan_builder = scan_builder.with_limit(limit);
             }
 
@@ -998,6 +996,31 @@ mod tests {
                 .map(|metric| metric.as_usize()),
             Some(1)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_applies_limit_after_filtering() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "filtered-limit/file.vortex";
+        let batch = record_batch!((
+            "a",
+            Int32,
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+        ))
+        .unwrap();
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let filter = logical2physical(&col("a").gt(lit(0_i32)), table_schema.table_schema());
+
+        let mut opener = make_opener(object_store, table_schema, Some(filter));
+        opener.limit = Some(3);
+
+        let batches = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
 
         Ok(())
     }

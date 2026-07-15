@@ -40,6 +40,8 @@ use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
 use crate::LayoutReaderRef;
+use crate::scan::limit::SharedRowLimit;
+use crate::scan::limit::limit_array_stream_shared;
 use crate::scan::scan_builder::ScanBuilder;
 
 /// An implementation of a [`DataSource`] that reads data from a [`LayoutReaderRef`].
@@ -157,6 +159,8 @@ impl DataSource for LayoutReaderDataSource {
             }
         }
 
+        let shared_limit = scan_request.limit.map(SharedRowLimit::new);
+
         Ok(Box::new(LayoutReaderScan {
             reader: Arc::clone(&self.reader),
             session: self.session.clone(),
@@ -164,6 +168,7 @@ impl DataSource for LayoutReaderDataSource {
             projection: scan_request.projection,
             filter: scan_request.filter,
             limit: scan_request.limit,
+            shared_limit,
             selection: scan_request.selection,
             ordered: scan_request.ordered,
             metrics_registry: self.metrics_registry.clone(),
@@ -185,6 +190,7 @@ struct LayoutReaderScan {
     projection: Expression,
     filter: Option<Expression>,
     limit: Option<u64>,
+    shared_limit: Option<SharedRowLimit>,
     ordered: bool,
     selection: Selection,
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
@@ -251,6 +257,7 @@ impl Stream for LayoutReaderScan {
             projection: this.projection.clone(),
             filter: this.filter.clone(),
             limit: split_limit,
+            shared_limit: this.shared_limit.clone(),
             ordered: this.ordered,
             row_range,
             selection: this.selection.clone(),
@@ -278,6 +285,7 @@ struct LayoutReaderSplit {
     projection: Expression,
     filter: Option<Expression>,
     limit: Option<u64>,
+    shared_limit: Option<SharedRowLimit>,
     ordered: bool,
     row_range: Range<u64>,
     selection: Selection,
@@ -312,6 +320,7 @@ impl Partition for LayoutReaderSplit {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
+        let shared_limit = self.shared_limit.clone();
         let builder = ScanBuilder::new(self.session, self.reader)
             .with_row_range(self.row_range)
             .with_selection(self.selection)
@@ -324,7 +333,7 @@ impl Partition for LayoutReaderSplit {
         let dtype = builder.dtype()?;
         // Use into_stream() which creates a LazyScanStream that spawns individual I/O
         // tasks onto the runtime, enabling parallel execution across executor threads.
-        let stream = builder.into_stream()?;
+        let stream = limit_array_stream_shared(builder.into_stream()?, shared_limit);
 
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,
@@ -389,5 +398,145 @@ impl Partition for Empty {
             dtype,
             stream::iter(iter),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::sync::Arc;
+
+    use futures::TryStreamExt;
+    use vortex_array::IntoArray;
+    use vortex_array::MaskFuture;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::FieldMask;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::expr::Expression;
+    use vortex_array::expr::root;
+    use vortex_error::VortexResult;
+    use vortex_io::runtime::BlockingRuntime;
+    use vortex_io::runtime::single::SingleThreadRuntime;
+    use vortex_mask::Mask;
+    use vortex_scan::DataSource;
+    use vortex_scan::ScanRequest;
+
+    use super::LayoutReaderDataSource;
+    use crate::ArrayFuture;
+    use crate::LayoutReader;
+    use crate::RowSplits;
+    use crate::SplitRange;
+    use crate::scan::test::session_with_handle;
+
+    #[derive(Debug)]
+    struct TestLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+        row_count: u64,
+    }
+
+    impl TestLayoutReader {
+        fn new(row_count: u64) -> Self {
+            Self {
+                name: Arc::from("test"),
+                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+                row_count,
+            }
+        }
+    }
+
+    impl LayoutReader for TestLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            self.row_count
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            let row_range = row_range.clone();
+
+            Ok(Box::pin(async move {
+                let start = i32::try_from(row_range.start)?;
+                let end = i32::try_from(row_range.end)?;
+                PrimitiveArray::from_iter(start..end)
+                    .into_array()
+                    .filter(mask.await?)
+            }))
+        }
+    }
+
+    #[test]
+    fn filtered_limit_is_global_across_scan_partitions() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let source = LayoutReaderDataSource::new(Arc::new(TestLayoutReader::new(6)), session)
+            .with_split_max_row_count(2);
+
+        let scan = runtime.block_on(source.scan(ScanRequest {
+            filter: Some(root()),
+            limit: Some(3),
+            ordered: true,
+            ..Default::default()
+        }))?;
+        let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let mut values = Vec::new();
+        for partition in partitions {
+            for chunk in runtime.block_on_stream(partition.execute()?) {
+                let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
+                values.extend(primitive.into_buffer::<i32>());
+            }
+        }
+
+        assert_eq!(values, [0, 1, 2]);
+        Ok(())
     }
 }

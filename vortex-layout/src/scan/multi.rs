@@ -57,6 +57,8 @@ use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
+use crate::scan::limit::SharedRowLimit;
+use crate::scan::limit::limit_array_stream_shared;
 use crate::scan::scan_builder::ScanBuilder;
 
 /// Default concurrency for opening deferred readers.
@@ -301,10 +303,13 @@ impl DataSource for MultiLayoutDataSource {
 
         let dtype = scan_request.projection.return_dtype(&self.dtype)?;
 
+        let shared_limit = scan_request.limit.map(SharedRowLimit::new);
+
         Ok(Box::new(MultiLayoutScan {
             session: self.session.clone(),
             dtype,
             request: scan_request,
+            shared_limit,
             ready,
             deferred,
             handle: self.session.handle(),
@@ -321,6 +326,7 @@ struct MultiLayoutScan {
     session: VortexSession,
     dtype: DType,
     request: ScanRequest,
+    shared_limit: Option<SharedRowLimit>,
     ready: VecDeque<LayoutReaderRef>,
     deferred: VecDeque<Arc<dyn LayoutReaderFactory>>,
     handle: vortex_io::runtime::Handle,
@@ -346,6 +352,7 @@ impl DataSourceScan for MultiLayoutScan {
             session,
             dtype: _,
             request,
+            shared_limit,
             ready,
             deferred,
             handle,
@@ -400,7 +407,13 @@ impl DataSourceScan for MultiLayoutScan {
             .chain(deferred_stream)
             .enumerate()
             .flat_map(move |(i, reader_result)| match reader_result {
-                Ok(reader) => reader_partition(i, reader, session.clone(), request.clone()),
+                Ok(reader) => reader_partition(
+                    i,
+                    reader,
+                    session.clone(),
+                    request.clone(),
+                    shared_limit.clone(),
+                ),
                 Err(e) => stream::once(async move { Err(e) }).boxed(),
             })
             .boxed()
@@ -417,6 +430,7 @@ fn reader_partition(
     reader: LayoutReaderRef,
     session: VortexSession,
     request: ScanRequest,
+    shared_limit: Option<SharedRowLimit>,
 ) -> PartitionStream {
     let row_count = reader.row_count();
     let row_range = request.row_range.clone().unwrap_or(0..row_count);
@@ -462,6 +476,7 @@ fn reader_partition(
                 row_range: Some(row_range),
                 ..request
             },
+            shared_limit,
             index: partition_idx,
         }) as PartitionRef)
     })
@@ -476,6 +491,7 @@ struct MultiLayoutPartition {
     reader: LayoutReaderRef,
     session: VortexSession,
     request: ScanRequest,
+    shared_limit: Option<SharedRowLimit>,
     index: usize,
 }
 
@@ -511,6 +527,7 @@ impl Partition for MultiLayoutPartition {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
+        let shared_limit = self.shared_limit.clone();
         let request = self.request;
         let mut builder = ScanBuilder::new(self.session, self.reader)
             .with_selection(request.selection)
@@ -524,7 +541,7 @@ impl Partition for MultiLayoutPartition {
         }
 
         let dtype = builder.dtype()?;
-        let stream = builder.into_stream()?;
+        let stream = limit_array_stream_shared(builder.into_stream()?, shared_limit);
 
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,
