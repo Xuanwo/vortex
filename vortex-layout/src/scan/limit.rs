@@ -50,3 +50,76 @@ impl RowLimit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+
+    use vortex_mask::Mask;
+
+    use super::RowLimit;
+
+    #[test]
+    fn reserve_grants_up_to_the_remaining_budget() {
+        let limit = RowLimit::new(5);
+        assert_eq!(limit.reserve(3), 3);
+        assert!(!limit.is_exhausted());
+        // Only two rows remain, so a larger request saturates at what is left.
+        assert_eq!(limit.reserve(10), 2);
+        assert!(limit.is_exhausted());
+        // Once exhausted, further requests grant nothing.
+        assert_eq!(limit.reserve(1), 0);
+    }
+
+    #[test]
+    fn limit_keeps_the_earliest_granted_rows() {
+        let limit = RowLimit::new(2);
+        // Rows 0, 2, 3, 5 are selected; only the first two survive the budget of 2.
+        let mask = Mask::from_iter([true, false, true, true, false, true]);
+        let limited = limit.limit(mask);
+
+        assert_eq!(limited.true_count(), 2);
+        assert!(limited.value(0));
+        assert!(limited.value(2));
+        assert!(!limited.value(3));
+        assert!(!limited.value(5));
+        assert!(limit.is_exhausted());
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_the_budget() {
+        const THREADS: usize = 8;
+        const PER_THREAD: u64 = 10_000;
+        const LIMIT: u64 = 25_000;
+
+        let limit = RowLimit::new(LIMIT);
+        let granted_total = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let limit = limit.clone();
+                let granted_total = Arc::clone(&granted_total);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    // Start all threads together to maximize contention on the atomic.
+                    barrier.wait();
+                    let mut local = 0;
+                    for _ in 0..PER_THREAD {
+                        local += limit.reserve(1);
+                    }
+                    granted_total.fetch_add(local, Ordering::Relaxed);
+                });
+            }
+        });
+
+        // Total requested (THREADS * PER_THREAD = 80_000) exceeds the budget, so exactly the
+        // budget is granted across all threads — no double-grant, over-grant, or lost reservation.
+        assert_eq!(granted_total.load(Ordering::Relaxed), LIMIT);
+        assert!(limit.is_exhausted());
+    }
+}

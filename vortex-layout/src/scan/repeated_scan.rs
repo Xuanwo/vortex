@@ -62,6 +62,11 @@ pub struct RepeatedScan {
     /// The number of splits to make progress on concurrently **per-thread**.
     concurrency: usize,
     /// Maximal number of rows to read (after filtering).
+    ///
+    /// When no shared [`RowLimit`] (`row_limit`) is set, this limit is applied independently to
+    /// each `execute_*` call: a `RepeatedScan` executed over several row ranges may therefore
+    /// return up to `limit` rows *per call*. Supply a shared `row_limit` to cap the total across
+    /// calls and sibling partitions.
     limit: Option<u64>,
     /// An optional row limit shared with sibling external partitions.
     row_limit: Option<RowLimit>,
@@ -159,8 +164,11 @@ impl TaskStream {
                     // `selection`.
                     let row_mask = selection.row_mask(&range);
                     let task = (!row_mask.mask().all_false()).then(|| {
+                        // A synchronous split-construction failure happens before any row is
+                        // reserved, so it is recoverable (yielded as a stream error) rather than
+                        // terminal (which would abort the whole scan). See the `TaskResult` docs.
                         ctx.split_exec(row_mask, Some(row_limit.clone()))
-                            .unwrap_or_else(TaskFuture::terminal)
+                            .unwrap_or_else(TaskFuture::recoverable)
                     });
                     future::ready(task.map(|task| handle.spawn(task)))
                 }),
@@ -487,10 +495,8 @@ impl RepeatedScan {
         // ranges up front. A no-filter limit is applied to each selection mask inside `execute`.
         let tasks = TaskStream::eager(handle, self.execute(row_range, row_limit)?);
 
-        Ok({
-            let ordered = self.ordered;
-            ScheduledTaskStream::new(tasks, ordered, concurrency)
-        })
+        let ordered = self.ordered;
+        Ok(ScheduledTaskStream::new(tasks, ordered, concurrency))
     }
 
     /// Ordered filtered scan with a shared row limit.

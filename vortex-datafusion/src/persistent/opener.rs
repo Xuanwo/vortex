@@ -1014,13 +1014,30 @@ mod tests {
             write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
         let file = PartitionedFile::new(file_path.to_string(), data_size);
         let table_schema = TableSchema::from_file_schema(batch.schema());
-        let filter = logical2physical(&col("a").gt(lit(0_i32)), table_schema.table_schema());
+        // `a > 3` excludes the first three rows, so a limit applied *before* filtering would take
+        // rows [1, 2, 3] and filter them all out (yielding nothing), whereas a limit applied
+        // *after* filtering yields the first three matching rows [4, 5, 6]. Asserting the values
+        // (not just the count) is what makes this test able to detect a pre-filter regression.
+        let filter = logical2physical(&col("a").gt(lit(3_i32)), table_schema.table_schema());
 
         let mut opener = make_opener(object_store, table_schema, Some(filter));
         opener.limit = Some(3);
 
         let batches = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("projected column should be Int32")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<i32>>();
+
+        assert_eq!(values, [4, 5, 6]);
 
         Ok(())
     }

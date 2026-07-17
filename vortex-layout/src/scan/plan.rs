@@ -213,7 +213,7 @@ impl Plan {
 /// The final mask is limited before it is given to the reader to perform a filtered projection
 /// over the split data, yielding the projected array (or `None` when the split selects no rows).
 /// Limiting before projection prevents decode work for rows that the scan cannot return.
-pub fn split_exec(
+pub(crate) fn split_exec(
     ctx: Arc<TaskContext>,
     read_mask: RowMask,
     row_limit: Option<RowLimit>,
@@ -276,7 +276,7 @@ pub fn split_exec(
 /// system can prefetch while earlier splits are still reserving), but it neither reserves against
 /// the limit nor projects. The caller reserves the returned mask in split order and then projects
 /// it via [`project_split`], which keeps ordered `LIMIT` semantics without serializing I/O.
-pub fn filter_split(
+pub(crate) fn filter_split(
     ctx: Arc<TaskContext>,
     read_mask: RowMask,
 ) -> BoxFuture<'static, VortexResult<(Range<u64>, Mask)>> {
@@ -299,7 +299,11 @@ pub fn filter_split(
 ///
 /// This is the second stage of the ordered filtered-limit pipeline, run after the caller has
 /// reserved rows against the limit in split order (see [`filter_split`]).
-pub fn project_split(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> TaskFuture {
+pub(crate) fn project_split(
+    ctx: Arc<TaskContext>,
+    row_range: Range<u64>,
+    mask: Mask,
+) -> TaskFuture {
     TaskFuture::deferred_projection(ctx, row_range, mask)
 }
 

@@ -1403,6 +1403,59 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn filtered_limit_zero_produces_no_rows() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let reader = Arc::new(FilteringLayoutReader::new(8, |_| true));
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(0)
+            .into_stream()?;
+        let values = collect_scan_values(runtime.block_on_stream(stream))?;
+        drain_runtime(&runtime);
+
+        assert!(values.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_limit_exceeding_matches_returns_all_matches() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        // Only odd rows match, so there are four matching rows (1, 3, 5, 7).
+        let reader = Arc::new(FilteringLayoutReader::new(8, |row| row % 2 == 1));
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(100)
+            .into_stream()?;
+        let values = collect_scan_values(runtime.block_on_stream(stream))?;
+        drain_runtime(&runtime);
+
+        // The scan terminates cleanly at end of input rather than hanging on the unfilled budget.
+        assert_eq!(values, [1, 3, 5, 7]);
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_limit_over_empty_input_produces_no_rows() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let reader = Arc::new(FilteringLayoutReader::new(0, |_| true));
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(3)
+            .into_stream()?;
+        let values = collect_scan_values(runtime.block_on_stream(stream))?;
+        drain_runtime(&runtime);
+
+        assert!(values.is_empty());
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct BlockingSplitsLayoutReader {
         name: Arc<str>,

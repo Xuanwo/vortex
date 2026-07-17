@@ -19,6 +19,7 @@ use vortex_arrow::ArrowSessionExt;
 use vortex_error::VortexResult;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::scan::scan_builder::ScanBuilder;
 
@@ -54,9 +55,7 @@ impl ScanBuilder {
         let struct_field = Arc::new(Field::new_struct("", schema.fields().clone(), false));
         let session = self.session().clone();
         let handle = session.handle();
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let concurrency = get_available_parallelism().unwrap_or(1);
 
         let stream = self
             .into_stream()?
