@@ -46,7 +46,6 @@ use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
-use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutReader;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::split_by::SplitBy;
@@ -429,9 +428,7 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_concurrency(concurrency);
             }
 
-            let stream_target_field =
-                Arc::new(Field::new_struct("", stream_schema.fields().clone(), false));
-            let handle = session.handle();
+            let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
             let file_location = file.object_meta.location.clone();
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
@@ -440,24 +437,21 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
+                // Convert to Arrow inline on the polling thread: DataFusion sources are expected
+                // to do their CPU work inside `poll_next`, and spawning this onto the blocking
+                // pool oversubscribes the CPU.
                 .map(move |chunk| {
-                    let session = session.clone();
-                    let stream_target_field = Arc::clone(&stream_target_field);
-                    let handle = handle.clone();
-                    handle.spawn_blocking(move || {
-                        let mut ctx = session.create_execution_ctx();
-                        chunk.and_then(|chunk| {
-                            let arrow_session = ctx.session().clone();
-                            let arrow = arrow_session.arrow().execute_arrow(
-                                chunk,
-                                Some(stream_target_field.as_ref()),
-                                &mut ctx,
-                            )?;
-                            Ok(RecordBatch::from(arrow.as_struct().clone()))
-                        })
+                    let mut ctx = session.create_execution_ctx();
+                    chunk.and_then(|chunk| {
+                        let arrow_session = ctx.session().clone();
+                        let arrow = arrow_session.arrow().execute_arrow(
+                            chunk,
+                            Some(&stream_target_field),
+                            &mut ctx,
+                        )?;
+                        Ok(RecordBatch::from(arrow.as_struct().clone()))
                     })
                 })
-                .buffered(2)
                 .map_err(move |e: VortexError| vortex_file_read_error(&file_location, e))
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
