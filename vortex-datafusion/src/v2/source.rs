@@ -98,6 +98,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
@@ -688,7 +689,7 @@ where
         .map(move |stream_result| {
             let handle = handle.clone();
             let receiver = stream_result.map(|mut stream| {
-                let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_BUFFER_CAPACITY);
+                let (tx, rx) = mpsc::channel(CHUNK_BUFFER_CAPACITY);
                 handle
                     .spawn(async move {
                         loop {
@@ -738,6 +739,7 @@ mod tests {
     use futures::Stream;
     use futures::TryStreamExt;
     use tokio::sync::Notify;
+    use tokio::sync::oneshot;
     use vortex::array::ArrayRef;
     use vortex::array::IntoArray;
     use vortex::array::VortexSessionExecute;
@@ -773,7 +775,7 @@ mod tests {
         Ok(values)
     }
 
-    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+    struct DropNotifier(Option<oneshot::Sender<()>>);
 
     impl Drop for DropNotifier {
         fn drop(&mut self) {
@@ -858,7 +860,7 @@ mod tests {
     async fn ordered_flatten_cancels_a_pending_drain_when_dropped() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let started = Arc::new(Notify::new());
-        let (dropped_send, dropped_recv) = tokio::sync::oneshot::channel();
+        let (dropped_send, dropped_recv) = oneshot::channel();
         let pending = ArrayStreamAdapter::new(
             dtype,
             DropNotifyingPendingStream {
