@@ -231,7 +231,7 @@ pub(crate) fn split_exec(
             row_mask
         };
         if row_mask.all_false() {
-            return Ok(async { TaskResult::Array(None) }.boxed());
+            return Ok(TaskFuture::empty());
         }
 
         let projection = match ctx
@@ -239,17 +239,16 @@ pub(crate) fn split_exec(
             .projection_evaluation(&row_range, MaskFuture::ready(row_mask))
         {
             Ok(projection) => projection,
-            Err(err) if limited => return Ok(async move { TaskResult::Terminal(err) }.boxed()),
+            Err(err) if limited => return Ok(TaskFuture::terminal(err)),
             Err(err) => return Err(err),
         };
-        return Ok(async move {
+        return Ok(TaskFuture::new(async move {
             match projection.await {
                 Ok(array) => TaskResult::Array(Some(array)),
                 Err(err) if limited => TaskResult::Terminal(err),
                 Err(err) => TaskResult::Recoverable(err),
             }
-        }
-        .boxed());
+        }));
     };
 
     validate_predicates(&ctx, filter)?;
@@ -259,7 +258,7 @@ pub(crate) fn split_exec(
         let projection = ctx
             .projection
             .projection_evaluation(&row_range, filter_mask.clone())?;
-        return Ok(async move {
+        return Ok(TaskFuture::new(async move {
             let mask = match filter_mask.await {
                 Ok(mask) => mask,
                 Err(err) => return TaskResult::Recoverable(err),
@@ -272,8 +271,7 @@ pub(crate) fn split_exec(
                 Ok(array) => TaskResult::Array(Some(array)),
                 Err(err) => TaskResult::Recoverable(err),
             }
-        }
-        .boxed());
+        }));
     };
 
     let array_fut = async move {
@@ -299,7 +297,7 @@ pub(crate) fn split_exec(
         }
     };
 
-    Ok(array_fut.boxed())
+    Ok(TaskFuture::new(array_fut))
 }
 
 pub(crate) fn filter_split(
@@ -329,7 +327,7 @@ pub(crate) fn project_split(
     row_range: Range<u64>,
     mask: Mask,
 ) -> TaskFuture {
-    async move {
+    TaskFuture::new(async move {
         let projection = match ctx
             .projection
             .projection_evaluation(&row_range, MaskFuture::ready(mask))
@@ -341,8 +339,7 @@ pub(crate) fn project_split(
             Ok(array) => TaskResult::Array(Some(array)),
             Err(err) => TaskResult::Terminal(err),
         }
-    }
-    .boxed()
+    })
 }
 
 fn validate_predicates(ctx: &TaskContext, filter: &FilterExpr) -> VortexResult<()> {

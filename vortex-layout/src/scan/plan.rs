@@ -3,9 +3,13 @@
 
 //! Split scanning task implementation.
 
+use std::future::Future;
 use std::ops::BitAnd;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
 use bit_vec::BitVec;
 use futures::FutureExt;
@@ -19,6 +23,7 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
 
+use crate::ArrayFuture;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
@@ -38,7 +43,125 @@ pub(crate) enum TaskResult {
     Terminal(VortexError),
 }
 
-pub(crate) type TaskFuture = BoxFuture<'static, TaskResult>;
+/// A future that executes one split and classifies any failure by whether it happened before or
+/// after a row-limit reservation.
+#[must_use = "split tasks must be scheduled or awaited"]
+pub(crate) struct TaskFuture {
+    inner: BoxFuture<'static, TaskResult>,
+}
+
+#[derive(Clone, Copy)]
+enum ErrorDisposition {
+    Recoverable,
+    Terminal,
+}
+
+impl ErrorDisposition {
+    fn result(self, error: VortexError) -> TaskResult {
+        match self {
+            Self::Recoverable => TaskResult::Recoverable(error),
+            Self::Terminal => TaskResult::Terminal(error),
+        }
+    }
+}
+
+impl TaskFuture {
+    pub(crate) fn new(future: impl Future<Output = TaskResult> + Send + 'static) -> Self {
+        Self {
+            inner: future.boxed(),
+        }
+    }
+
+    fn ready(result: TaskResult) -> Self {
+        Self::new(futures::future::ready(result))
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self::ready(TaskResult::Array(None))
+    }
+
+    pub(crate) fn recoverable(error: VortexError) -> Self {
+        Self::ready(TaskResult::Recoverable(error))
+    }
+
+    pub(crate) fn terminal(error: VortexError) -> Self {
+        Self::ready(TaskResult::Terminal(error))
+    }
+
+    fn projection(projection: ArrayFuture, errors: ErrorDisposition) -> Self {
+        Self::new(async move {
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(error) => errors.result(error),
+            }
+        })
+    }
+
+    fn filtered_projection(filter_mask: MaskFuture, projection: ArrayFuture) -> Self {
+        Self::new(async move {
+            let mask = match filter_mask.await {
+                Ok(mask) => mask,
+                Err(error) => return TaskResult::Recoverable(error),
+            };
+            if mask.all_false() {
+                return TaskResult::Array(None);
+            }
+
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(error) => TaskResult::Recoverable(error),
+            }
+        })
+    }
+
+    fn limited_filtered_projection(
+        ctx: Arc<TaskContext>,
+        row_range: Range<u64>,
+        filter_mask: MaskFuture,
+        row_limit: RowLimit,
+    ) -> Self {
+        Self::new(async move {
+            let mask = match filter_mask.await {
+                Ok(mask) => mask,
+                Err(error) => return TaskResult::Recoverable(error),
+            };
+            // A filter error above returns before reserving any rows. Once filtering has
+            // succeeded, reserve only the matching rows and defer projection construction until
+            // this task is polled by the runtime.
+            let mask = row_limit.limit(mask);
+            if mask.all_false() {
+                return TaskResult::Array(None);
+            }
+
+            Self::deferred_projection(ctx, row_range, mask).await
+        })
+    }
+
+    fn deferred_projection(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> Self {
+        Self::new(async move {
+            let projection = match ctx.reader.projection_evaluation(
+                &row_range,
+                &ctx.projection,
+                MaskFuture::ready(mask),
+            ) {
+                Ok(projection) => projection,
+                Err(error) => return TaskResult::Terminal(error),
+            };
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(error) => TaskResult::Terminal(error),
+            }
+        })
+    }
+}
+
+impl Future for TaskFuture {
+    type Output = TaskResult;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
+    }
+}
 
 pub(crate) struct Plan {
     layout_reader: LayoutReaderRef,
@@ -106,7 +229,7 @@ pub fn split_exec(
             row_mask
         };
         if row_mask.all_false() {
-            return Ok(async { TaskResult::Array(None) }.boxed());
+            return Ok(TaskFuture::empty());
         }
 
         // With no filter, limit the selection before constructing projection work.
@@ -116,17 +239,15 @@ pub fn split_exec(
             MaskFuture::ready(row_mask),
         ) {
             Ok(projection) => projection,
-            Err(err) if limited => return Ok(async move { TaskResult::Terminal(err) }.boxed()),
+            Err(err) if limited => return Ok(TaskFuture::terminal(err)),
             Err(err) => return Err(err),
         };
-        return Ok(async move {
-            match projection.await {
-                Ok(array) => TaskResult::Array(Some(array)),
-                Err(err) if limited => TaskResult::Terminal(err),
-                Err(err) => TaskResult::Recoverable(err),
-            }
-        }
-        .boxed());
+        let errors = if limited {
+            ErrorDisposition::Terminal
+        } else {
+            ErrorDisposition::Recoverable
+        };
+        return Ok(TaskFuture::projection(projection, errors));
     };
 
     let filter_mask = build_filter_mask(&ctx.reader, filter, &row_range, row_mask);
@@ -137,50 +258,15 @@ pub fn split_exec(
         let projection =
             ctx.reader
                 .projection_evaluation(&row_range, &ctx.projection, filter_mask.clone())?;
-        let array_fut = async move {
-            let mask = match filter_mask.await {
-                Ok(mask) => mask,
-                Err(err) => return TaskResult::Recoverable(err),
-            };
-            if mask.all_false() {
-                return TaskResult::Array(None);
-            }
-
-            match projection.await {
-                Ok(array) => TaskResult::Array(Some(array)),
-                Err(err) => TaskResult::Recoverable(err),
-            }
-        };
-        return Ok(array_fut.boxed());
+        return Ok(TaskFuture::filtered_projection(filter_mask, projection));
     };
 
-    let array_fut = async move {
-        let mask = match filter_mask.await {
-            Ok(mask) => mask,
-            Err(err) => return TaskResult::Recoverable(err),
-        };
-        // A filter error above returns before reserving any rows. Once filtering has succeeded,
-        // reserve only the matching rows and construct projection work for that limited mask.
-        let mask = row_limit.limit(mask);
-        if mask.all_false() {
-            return TaskResult::Array(None);
-        }
-
-        let projection = match ctx.reader.projection_evaluation(
-            &row_range,
-            &ctx.projection,
-            MaskFuture::ready(mask),
-        ) {
-            Ok(projection) => projection,
-            Err(err) => return TaskResult::Terminal(err),
-        };
-        match projection.await {
-            Ok(array) => TaskResult::Array(Some(array)),
-            Err(err) => TaskResult::Terminal(err),
-        }
-    };
-
-    Ok(array_fut.boxed())
+    Ok(TaskFuture::limited_filtered_projection(
+        ctx,
+        row_range,
+        filter_mask,
+        row_limit,
+    ))
 }
 
 /// Evaluate the filter for a split and return the matching mask together with its row range.
@@ -214,21 +300,7 @@ pub fn filter_split(
 /// This is the second stage of the ordered filtered-limit pipeline, run after the caller has
 /// reserved rows against the limit in split order (see [`filter_split`]).
 pub fn project_split(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> TaskFuture {
-    async move {
-        let projection = match ctx.reader.projection_evaluation(
-            &row_range,
-            &ctx.projection,
-            MaskFuture::ready(mask),
-        ) {
-            Ok(projection) => projection,
-            Err(err) => return TaskResult::Terminal(err),
-        };
-        match projection.await {
-            Ok(array) => TaskResult::Array(Some(array)),
-            Err(err) => TaskResult::Terminal(err),
-        }
-    }
-    .boxed()
+    TaskFuture::deferred_projection(ctx, row_range, mask)
 }
 
 /// Build the filtered mask for a split.
@@ -312,4 +384,177 @@ pub(crate) struct TaskContext {
     filter: Option<Arc<FilterExpr>>,
     reader: LayoutReaderRef,
     projection: Expression,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+    use vortex_array::IntoArray;
+    use vortex_array::MaskFuture;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::FieldMask;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::expr::Expression;
+    use vortex_array::expr::root;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_mask::Mask;
+
+    use super::TaskContext;
+    use super::TaskResult;
+    use super::project_split;
+    use crate::ArrayFuture;
+    use crate::LayoutReader;
+    use crate::RowSplits;
+    use crate::SplitRange;
+
+    struct BlockingProjectionReader {
+        name: Arc<str>,
+        dtype: DType,
+        started: mpsc::Sender<()>,
+        gate: Arc<Mutex<()>>,
+    }
+
+    impl LayoutReader for BlockingProjectionReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            1
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            _mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            self.started
+                .send(())
+                .map_err(|_| vortex_err!("test projection-start receiver dropped"))?;
+            let _guard = self.gate.lock();
+            let array = PrimitiveArray::from_iter([0_i32]).into_array();
+            Ok(Box::pin(async move { Ok(array) }))
+        }
+    }
+
+    #[test]
+    fn project_split_defers_projection_construction_until_task_poll() -> VortexResult<()> {
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock();
+        let (started_send, started_recv) = mpsc::channel();
+        let reader: Arc<dyn LayoutReader> = Arc::new(BlockingProjectionReader {
+            name: Arc::from("blocking-projection"),
+            dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+            started: started_send,
+            gate: Arc::clone(&gate),
+        });
+        let ctx = Arc::new(TaskContext {
+            filter: None,
+            reader,
+            projection: root(),
+        });
+
+        let (task_send, task_recv) = mpsc::channel();
+        let construction = thread::spawn(move || {
+            let task = project_split(ctx, 0..1, Mask::new_true(1));
+            drop(task_send.send(task));
+        });
+
+        let task = match task_recv.recv_timeout(Duration::from_secs(1)) {
+            Ok(task) => task,
+            Err(_) => {
+                drop(guard);
+                drop(construction.join());
+                return Err(vortex_err!(
+                    "constructing a projection task blocked before it was polled"
+                ));
+            }
+        };
+        if construction.join().is_err() {
+            return Err(vortex_err!("projection-task construction panicked"));
+        }
+        match started_recv.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(()) => {
+                return Err(vortex_err!(
+                    "projection construction started before the task was polled"
+                ));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(vortex_err!(
+                    "projection-start sender disconnected unexpectedly"
+                ));
+            }
+        }
+
+        let (result_send, result_recv) = mpsc::channel();
+        let execution = thread::spawn(move || {
+            let result = futures::executor::block_on(task);
+            drop(result_send.send(result));
+        });
+
+        if started_recv.recv_timeout(Duration::from_secs(1)).is_err() {
+            drop(guard);
+            drop(execution.join());
+            return Err(vortex_err!(
+                "projection construction did not start when polled"
+            ));
+        }
+        drop(guard);
+        let result = result_recv
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| vortex_err!("projection task did not complete"))?;
+        if execution.join().is_err() {
+            return Err(vortex_err!("projection task panicked"));
+        }
+
+        assert!(matches!(result, TaskResult::Array(Some(_))));
+        Ok(())
+    }
 }

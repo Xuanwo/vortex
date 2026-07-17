@@ -437,6 +437,7 @@ mod test {
     use std::time::Duration;
 
     use futures::Stream;
+    use futures::channel::oneshot;
     use futures::task::noop_waker_ref;
     use parking_lot::Mutex;
     use vortex_array::ArrayRef;
@@ -1013,24 +1014,32 @@ mod test {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum FirstSplitFailure {
+        Filter,
+        Projection,
+    }
+
     #[derive(Debug)]
-    struct ErrorThenMatchLayoutReader {
+    struct FirstSplitFailureLayoutReader {
         name: Arc<str>,
         dtype: DType,
         projection_masks: Arc<Mutex<Vec<usize>>>,
+        failure: FirstSplitFailure,
     }
 
-    impl ErrorThenMatchLayoutReader {
-        fn new(projection_masks: Arc<Mutex<Vec<usize>>>) -> Self {
+    impl FirstSplitFailureLayoutReader {
+        fn new(projection_masks: Arc<Mutex<Vec<usize>>>, failure: FirstSplitFailure) -> Self {
             Self {
-                name: Arc::from("error-then-match"),
+                name: Arc::from("first-split-failure"),
                 dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
                 projection_masks,
+                failure,
             }
         }
     }
 
-    impl LayoutReader for ErrorThenMatchLayoutReader {
+    impl LayoutReader for FirstSplitFailureLayoutReader {
         fn name(&self) -> &Arc<str> {
             &self.name
         }
@@ -1070,7 +1079,7 @@ mod test {
             _expr: &Expression,
             mask: MaskFuture,
         ) -> VortexResult<MaskFuture> {
-            if row_range.start == 0 {
+            if row_range.start == 0 && matches!(self.failure, FirstSplitFailure::Filter) {
                 let len = mask.len();
                 return Ok(MaskFuture::new(len, async move {
                     Err(vortex_err!("first split filter failed"))
@@ -1087,10 +1096,14 @@ mod test {
         ) -> VortexResult<ArrayFuture> {
             let row_range = row_range.clone();
             let projection_masks = Arc::clone(&self.projection_masks);
+            let failure = self.failure;
 
             Ok(Box::pin(async move {
                 let mask = mask.await?;
                 projection_masks.lock().push(mask.true_count());
+                if row_range.start == 0 && matches!(failure, FirstSplitFailure::Projection) {
+                    return Err(vortex_err!("first split projection failed"));
+                }
                 let start = i32::try_from(row_range.start)
                     .map_err(|_| vortex_err!("row_range.start must fit in i32"))?;
                 let end = i32::try_from(row_range.end)
@@ -1098,6 +1111,114 @@ mod test {
                 PrimitiveArray::from_iter(start..end)
                     .into_array()
                     .filter(mask)
+            }))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct MatchThenErrorLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+        release_first_filter: Mutex<Option<oneshot::Sender<()>>>,
+        wait_for_later_filter: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl MatchThenErrorLayoutReader {
+        fn new() -> Self {
+            let (release_first_filter, wait_for_later_filter) = oneshot::channel();
+            Self {
+                name: Arc::from("match-then-error"),
+                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+                release_first_filter: Mutex::new(Some(release_first_filter)),
+                wait_for_later_filter: Mutex::new(Some(wait_for_later_filter)),
+            }
+        }
+    }
+
+    impl LayoutReader for MatchThenErrorLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            2
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            let row_range = split_range.row_range();
+            splits.push(split_range.row_offset() + row_range.start + 1);
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            let len = mask.len();
+            if row_range.start == 0 {
+                let wait_for_later_filter = self
+                    .wait_for_later_filter
+                    .lock()
+                    .take()
+                    .ok_or_else(|| vortex_err!("first split filter was evaluated twice"))?;
+                return Ok(MaskFuture::new(len, async move {
+                    wait_for_later_filter
+                        .await
+                        .map_err(|_| vortex_err!("later split filter was cancelled"))?;
+                    mask.await
+                }));
+            }
+
+            self.release_first_filter
+                .lock()
+                .take()
+                .ok_or_else(|| vortex_err!("later split filter was evaluated twice"))?
+                .send(())
+                .map_err(|_| vortex_err!("first split filter was cancelled"))?;
+            Ok(MaskFuture::new(len, async move {
+                Err(vortex_err!("later split filter failed"))
+            }))
+        }
+
+        fn projection_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            let row_range = row_range.clone();
+            Ok(Box::pin(async move {
+                let start = i32::try_from(row_range.start)
+                    .map_err(|_| vortex_err!("row_range.start must fit in i32"))?;
+                let end = i32::try_from(row_range.end)
+                    .map_err(|_| vortex_err!("row_range.end must fit in i32"))?;
+                PrimitiveArray::from_iter(start..end)
+                    .into_array()
+                    .filter(mask.await?)
             }))
         }
 
@@ -1173,13 +1294,33 @@ mod test {
     }
 
     #[test]
+    fn ordered_filtered_limit_drops_prefetched_filter_errors_after_the_budget_is_full()
+    -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let reader = Arc::new(MatchThenErrorLayoutReader::new());
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(1)
+            .into_stream()?;
+
+        // The first split waits until the later split has already produced its error. Once the
+        // first matching row fills the limit, that speculative error must be dropped.
+        let values = collect_scan_values(runtime.block_on_stream(stream))?;
+
+        assert_eq!(values, [0]);
+        Ok(())
+    }
+
+    #[test]
     fn filter_errors_are_stream_items_and_do_not_consume_the_limit() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
         let session = session_with_handle(runtime.handle());
         let projection_masks = Arc::new(Mutex::new(Vec::new()));
-        let reader = Arc::new(ErrorThenMatchLayoutReader::new(Arc::clone(
-            &projection_masks,
-        )));
+        let reader = Arc::new(FirstSplitFailureLayoutReader::new(
+            Arc::clone(&projection_masks),
+            FirstSplitFailure::Filter,
+        ));
         let stream = ScanBuilder::new(session, reader)
             .with_filter(root())
             .with_limit(1)
@@ -1198,6 +1339,29 @@ mod test {
         assert_eq!(primitive.into_buffer::<i32>().as_slice(), [1]);
         assert!(iter.next().is_none());
         assert_eq!(projection_masks.lock().as_slice(), [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_error_after_reservation_terminates_the_limited_scan() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let projection_masks = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(FirstSplitFailureLayoutReader::new(
+            Arc::clone(&projection_masks),
+            FirstSplitFailure::Projection,
+        ));
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            // A budget of two leaves room for the second matching split. Continuing after the
+            // first projection failure would therefore yield a second stream item.
+            .with_limit(2)
+            .into_stream()?;
+        let mut iter = runtime.block_on_stream(stream);
+
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
+        assert!(projection_masks.lock().contains(&1));
         Ok(())
     }
 
