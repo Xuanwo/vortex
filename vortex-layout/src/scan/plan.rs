@@ -13,6 +13,7 @@ use futures::future::BoxFuture;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::expr::Expression;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -23,7 +24,21 @@ use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 use crate::scan::limit::RowLimit;
 
-pub type TaskFuture = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;
+/// The result of a split task.
+///
+/// Filter errors happen before a row limit reserves any rows, so callers may report them and
+/// continue with later splits. Projection errors after reservation cannot safely release rows back
+/// to a concurrent limit, so callers must report them and terminate the limited scan.
+pub(crate) enum TaskResult {
+    /// A completed projection, or an empty split.
+    Array(Option<ArrayRef>),
+    /// An error that occurred before a row limit reserved rows.
+    Recoverable(VortexError),
+    /// An error that occurred after a row limit reserved rows.
+    Terminal(VortexError),
+}
+
+pub(crate) type TaskFuture = BoxFuture<'static, TaskResult>;
 
 pub(crate) struct Plan {
     layout_reader: LayoutReaderRef,
@@ -84,22 +99,34 @@ pub fn split_exec(
     let row_mask = read_mask.mask().clone();
 
     let Some(filter) = ctx.filter.as_ref() else {
+        let limited = row_limit.is_some();
         let row_mask = if let Some(limit) = row_limit {
             limit.limit(row_mask)
         } else {
             row_mask
         };
         if row_mask.all_false() {
-            return Ok(async { Ok(None) }.boxed());
+            return Ok(async { TaskResult::Array(None) }.boxed());
         }
 
         // With no filter, limit the selection before constructing projection work.
-        let projection = ctx.reader.projection_evaluation(
+        let projection = match ctx.reader.projection_evaluation(
             &row_range,
             &ctx.projection,
             MaskFuture::ready(row_mask),
-        )?;
-        return Ok(async move { projection.await.map(Some) }.boxed());
+        ) {
+            Ok(projection) => projection,
+            Err(err) if limited => return Ok(async move { TaskResult::Terminal(err) }.boxed()),
+            Err(err) => return Err(err),
+        };
+        return Ok(async move {
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(err) if limited => TaskResult::Terminal(err),
+                Err(err) => TaskResult::Recoverable(err),
+            }
+        }
+        .boxed());
     };
 
     let filter_mask = build_filter_mask(&ctx.reader, filter, &row_range, row_mask);
@@ -111,31 +138,46 @@ pub fn split_exec(
             ctx.reader
                 .projection_evaluation(&row_range, &ctx.projection, filter_mask.clone())?;
         let array_fut = async move {
-            let mask = filter_mask.await?;
+            let mask = match filter_mask.await {
+                Ok(mask) => mask,
+                Err(err) => return TaskResult::Recoverable(err),
+            };
             if mask.all_false() {
-                return Ok(None);
+                return TaskResult::Array(None);
             }
 
-            projection.await.map(Some)
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(err) => TaskResult::Recoverable(err),
+            }
         };
         return Ok(array_fut.boxed());
     };
 
     let array_fut = async move {
-        let mask = filter_mask.await?;
+        let mask = match filter_mask.await {
+            Ok(mask) => mask,
+            Err(err) => return TaskResult::Recoverable(err),
+        };
         // A filter error above returns before reserving any rows. Once filtering has succeeded,
         // reserve only the matching rows and construct projection work for that limited mask.
         let mask = row_limit.limit(mask);
         if mask.all_false() {
-            return Ok(None);
+            return TaskResult::Array(None);
         }
 
-        let projection = ctx.reader.projection_evaluation(
+        let projection = match ctx.reader.projection_evaluation(
             &row_range,
             &ctx.projection,
             MaskFuture::ready(mask),
-        )?;
-        projection.await.map(Some)
+        ) {
+            Ok(projection) => projection,
+            Err(err) => return TaskResult::Terminal(err),
+        };
+        match projection.await {
+            Ok(array) => TaskResult::Array(Some(array)),
+            Err(err) => TaskResult::Terminal(err),
+        }
     };
 
     Ok(array_fut.boxed())
@@ -171,15 +213,22 @@ pub fn filter_split(
 ///
 /// This is the second stage of the ordered filtered-limit pipeline, run after the caller has
 /// reserved rows against the limit in split order (see [`filter_split`]).
-pub fn project_split(
-    ctx: Arc<TaskContext>,
-    row_range: Range<u64>,
-    mask: Mask,
-) -> VortexResult<TaskFuture> {
-    let projection =
-        ctx.reader
-            .projection_evaluation(&row_range, &ctx.projection, MaskFuture::ready(mask))?;
-    Ok(async move { projection.await.map(Some) }.boxed())
+pub fn project_split(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> TaskFuture {
+    async move {
+        let projection = match ctx.reader.projection_evaluation(
+            &row_range,
+            &ctx.projection,
+            MaskFuture::ready(mask),
+        ) {
+            Ok(projection) => projection,
+            Err(err) => return TaskResult::Terminal(err),
+        };
+        match projection.await {
+            Ok(array) => TaskResult::Array(Some(array)),
+            Err(err) => TaskResult::Terminal(err),
+        }
+    }
+    .boxed()
 }
 
 /// Build the filtered mask for a split.

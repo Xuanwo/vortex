@@ -34,6 +34,7 @@ use vortex_utils::parallelism::get_available_parallelism;
 use crate::LayoutReaderRef;
 use crate::scan::limit::RowLimit;
 use crate::scan::plan;
+use crate::scan::plan::TaskResult;
 use crate::scan::plan_v2;
 use crate::scan::plan_v2::ScanPlanRef;
 use crate::scan::splits::Splits;
@@ -110,7 +111,7 @@ impl ExecutionTaskContext {
         }
     }
 
-    fn project_split(&self, row_range: Range<u64>, mask: Mask) -> VortexResult<plan::TaskFuture> {
+    fn project_split(&self, row_range: Range<u64>, mask: Mask) -> plan::TaskFuture {
         match self {
             Self::Plan(ctx) => plan::project_split(Arc::clone(ctx), row_range, mask),
             Self::PlanV2(ctx) => plan_v2::project_split(Arc::clone(ctx), row_range, mask),
@@ -331,7 +332,7 @@ impl RepeatedScan {
                     let spawned = (!row_mask.mask().all_false()).then(|| {
                         let task = ctx
                             .split_exec(row_mask, Some(row_limit.clone()))
-                            .unwrap_or_else(|err| async move { Err(err) }.boxed());
+                            .unwrap_or_else(|err| async move { TaskResult::Terminal(err) }.boxed());
                         handle.spawn(task)
                     });
                     async move { spawned }
@@ -387,46 +388,59 @@ impl RepeatedScan {
         };
 
         // Seam + stage two: reserve in split order (this map runs sequentially as the ordered
-        // stage-one stream is consumed), then spawn projection work for the reserved mask.
-        filter_tasks
+        // stage-one stream is consumed), then spawn projection work for the reserved mask. The
+        // second gate drops results that were already filtering when an earlier split exhausted
+        // the budget, including any later filter errors.
+        let stage_two_limit = row_limit.clone();
+        let tasks = filter_tasks
+            .take_while(move |_| futures::future::ready(!stage_two_limit.is_exhausted()))
             .map(move |result| {
                 let task: plan::TaskFuture = match result {
                     Ok((row_range, mask)) => {
                         let mask = row_limit.limit(mask);
                         if mask.all_false() {
-                            async { Ok(None) }.boxed()
+                            async { TaskResult::Array(None) }.boxed()
                         } else {
                             ctx.project_split(row_range, mask)
-                                .unwrap_or_else(|err| async move { Err(err) }.boxed())
                         }
                     }
-                    Err(err) => async move { Err(err) }.boxed(),
+                    Err(err) => async move { TaskResult::Recoverable(err) }.boxed(),
                 };
                 handle.spawn(task)
-            })
-            .buffered(concurrency)
-            .filter_map(|chunk| async move { chunk.transpose() })
-            .boxed()
+            });
+        schedule(tasks, true, concurrency)
     }
 }
 
-/// Spawn-buffer a stream of split tasks and transpose empty splits away.
+/// Spawn-buffer a stream of split tasks, preserving recoverable filter errors and stopping after
+/// a projection error that occurred after a row limit reservation.
 fn schedule<S>(
     tasks: S,
     ordered: bool,
     concurrency: usize,
 ) -> BoxStream<'static, VortexResult<ArrayRef>>
 where
-    S: Stream<Item = Task<VortexResult<Option<ArrayRef>>>> + Send + 'static,
+    S: Stream<Item = Task<TaskResult>> + Send + 'static,
 {
-    let stream = if ordered {
+    let mut stream = if ordered {
         tasks.buffered(concurrency).boxed()
     } else {
         tasks.buffer_unordered(concurrency).boxed()
     };
-    stream
-        .filter_map(|chunk| async move { chunk.transpose() })
-        .boxed()
+    async_stream::stream! {
+        while let Some(result) = stream.next().await {
+            match result {
+                TaskResult::Array(Some(array)) => yield Ok(array),
+                TaskResult::Array(None) => {}
+                TaskResult::Recoverable(err) => yield Err(err),
+                TaskResult::Terminal(err) => {
+                    yield Err(err);
+                    return;
+                }
+            }
+        }
+    }
+    .boxed()
 }
 
 fn intersect_ranges(left: Option<&Range<u64>>, right: Option<Range<u64>>) -> Option<Range<u64>> {
