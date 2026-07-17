@@ -437,12 +437,20 @@ mod tests {
     use crate::SplitRange;
     use crate::scan::test::session_with_handle;
 
+    /// A configurable [`LayoutReader`] test double. Splits come from the data source's
+    /// `with_split_max_row_count`; the filter passes rows through (optionally delaying the first
+    /// split to exercise concurrent prefetch), and projection masks/ranges plus evaluated filter
+    /// ranges are recorded for assertions.
     #[derive(Debug)]
     struct TestLayoutReader {
         name: Arc<str>,
         dtype: DType,
         row_count: u64,
+        split_size: Option<u64>,
+        delay_first_filter: bool,
         projection_masks: Option<Arc<Mutex<Vec<usize>>>>,
+        projection_ranges: Option<Arc<Mutex<Vec<Range<u64>>>>>,
+        filter_ranges: Arc<Mutex<Vec<Range<u64>>>>,
     }
 
     impl TestLayoutReader {
@@ -451,13 +459,41 @@ mod tests {
                 name: Arc::from("test"),
                 dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
                 row_count,
+                split_size: None,
+                delay_first_filter: false,
                 projection_masks: None,
+                projection_ranges: None,
+                filter_ranges: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_split_size(mut self, split_size: u64) -> Self {
+            self.split_size = Some(split_size);
+            self
         }
 
         fn with_projection_masks(mut self, projection_masks: Arc<Mutex<Vec<usize>>>) -> Self {
             self.projection_masks = Some(projection_masks);
             self
+        }
+
+        fn with_projection_ranges(
+            mut self,
+            projection_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+        ) -> Self {
+            self.projection_ranges = Some(projection_ranges);
+            self
+        }
+
+        fn with_delayed_first_filter(mut self) -> Self {
+            self.delay_first_filter = true;
+            self
+        }
+
+        /// Row ranges whose filter was actually evaluated (recorded when the filter future runs,
+        /// not when it is merely scheduled).
+        fn filter_ranges(&self) -> Arc<Mutex<Vec<Range<u64>>>> {
+            Arc::clone(&self.filter_ranges)
         }
     }
 
@@ -484,101 +520,14 @@ mod tests {
             split_range: &SplitRange,
             splits: &mut RowSplits,
         ) -> VortexResult<()> {
-            splits.push(split_range.root_row_range().end);
-            Ok(())
-        }
-
-        fn pruning_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: Mask,
-        ) -> VortexResult<MaskFuture> {
-            Ok(MaskFuture::ready(mask))
-        }
-
-        fn filter_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<MaskFuture> {
-            Ok(mask)
-        }
-
-        fn projection_evaluation(
-            &self,
-            row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<ArrayFuture> {
-            let row_range = row_range.clone();
-            let projection_masks = self.projection_masks.clone();
-
-            Ok(Box::pin(async move {
-                let mask = mask.await?;
-                if let Some(projection_masks) = projection_masks {
-                    projection_masks.lock().push(mask.true_count());
-                }
-                let start = i32::try_from(row_range.start)?;
-                let end = i32::try_from(row_range.end)?;
-                PrimitiveArray::from_iter(start..end)
-                    .into_array()
-                    .filter(mask)
-            }))
-        }
-    }
-
-    #[derive(Debug)]
-    struct DelayedFirstSplitReader {
-        name: Arc<str>,
-        dtype: DType,
-        projection_ranges: Arc<Mutex<Vec<Range<u64>>>>,
-        filter_ranges: Arc<Mutex<Vec<Range<u64>>>>,
-    }
-
-    impl DelayedFirstSplitReader {
-        fn new(projection_ranges: Arc<Mutex<Vec<Range<u64>>>>) -> Self {
-            Self {
-                name: Arc::from("delayed-first-split"),
-                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
-                projection_ranges,
-                filter_ranges: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        /// Row ranges whose filter was actually evaluated (recorded when the split's filter
-        /// future runs, not when it is merely scheduled).
-        fn filter_ranges(&self) -> Arc<Mutex<Vec<Range<u64>>>> {
-            Arc::clone(&self.filter_ranges)
-        }
-    }
-
-    impl LayoutReader for DelayedFirstSplitReader {
-        fn name(&self) -> &Arc<str> {
-            &self.name
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn dtype(&self) -> &DType {
-            &self.dtype
-        }
-
-        fn row_count(&self) -> u64 {
-            4
-        }
-
-        fn register_splits(
-            &self,
-            _field_mask: &[FieldMask],
-            split_range: &SplitRange,
-            splits: &mut RowSplits,
-        ) -> VortexResult<()> {
             let row_range = split_range.row_range();
-            splits.push(split_range.row_offset() + row_range.start + 2);
+            if let Some(size) = self.split_size {
+                let mut boundary = row_range.start + size;
+                while boundary < row_range.end {
+                    splits.push(split_range.row_offset() + boundary);
+                    boundary += size;
+                }
+            }
             splits.push(split_range.root_row_range().end);
             Ok(())
         }
@@ -599,11 +548,9 @@ mod tests {
             mask: MaskFuture,
         ) -> VortexResult<MaskFuture> {
             self.filter_ranges.lock().push(row_range.clone());
-            let delay = row_range.start == 0;
-            let len = mask.len();
-
-            Ok(MaskFuture::new(len, async move {
-                if delay {
+            if self.delay_first_filter && row_range.start == 0 {
+                let len = mask.len();
+                return Ok(MaskFuture::new(len, async move {
                     let mut yielded = false;
                     futures::future::poll_fn(move |cx| {
                         if yielded {
@@ -615,9 +562,10 @@ mod tests {
                         }
                     })
                     .await;
-                }
-                mask.await
-            }))
+                    mask.await
+                }));
+            }
+            Ok(mask)
         }
 
         fn projection_evaluation(
@@ -627,15 +575,22 @@ mod tests {
             mask: MaskFuture,
         ) -> VortexResult<ArrayFuture> {
             let row_range = row_range.clone();
-            let projection_ranges = Arc::clone(&self.projection_ranges);
+            let projection_masks = self.projection_masks.clone();
+            let projection_ranges = self.projection_ranges.clone();
 
             Ok(Box::pin(async move {
-                projection_ranges.lock().push(row_range.clone());
+                let mask = mask.await?;
+                if let Some(projection_masks) = projection_masks {
+                    projection_masks.lock().push(mask.true_count());
+                }
+                if let Some(projection_ranges) = projection_ranges {
+                    projection_ranges.lock().push(row_range.clone());
+                }
                 let start = i32::try_from(row_range.start)?;
                 let end = i32::try_from(row_range.end)?;
                 PrimitiveArray::from_iter(start..end)
                     .into_array()
-                    .filter(mask.await?)
+                    .filter(mask)
             }))
         }
     }
@@ -670,47 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn ordered_filtered_limit_waits_for_the_earlier_split() -> VortexResult<()> {
-        let runtime = SingleThreadRuntime::default();
-        let session = session_with_handle(runtime.handle());
-        let projection_ranges = Arc::new(Mutex::new(Vec::new()));
-        let source = LayoutReaderDataSource::new(
-            Arc::new(DelayedFirstSplitReader::new(Arc::clone(&projection_ranges))),
-            session,
-        )
-        .with_split_max_row_count(2);
-
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            filter: Some(root()),
-            limit: Some(1),
-            ordered: true,
-            ..Default::default()
-        }))?;
-        let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
-
-        let mut ctx = array_session().create_execution_ctx();
-        let mut values = Vec::new();
-        for partition in partitions {
-            for chunk in runtime.block_on_stream(partition.execute()?) {
-                let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
-                values.extend(primitive.into_buffer::<i32>());
-            }
-        }
-
-        assert_eq!(values, [0]);
-        let projection_ranges = projection_ranges.lock();
-        assert_eq!(projection_ranges.len(), 1);
-        assert_eq!(projection_ranges[0], 0..2);
-        Ok(())
-    }
-
-    #[test]
     fn ordered_filtered_limit_evaluates_later_split_filter_concurrently() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
         let session = session_with_handle(runtime.handle());
         let projection_ranges = Arc::new(Mutex::new(Vec::new()));
-        let reader = DelayedFirstSplitReader::new(Arc::clone(&projection_ranges));
+        let reader = TestLayoutReader::new(4)
+            .with_split_size(2)
+            .with_projection_ranges(Arc::clone(&projection_ranges))
+            .with_delayed_first_filter();
         let filter_ranges = reader.filter_ranges();
         let source =
             LayoutReaderDataSource::new(Arc::new(reader), session).with_split_max_row_count(2);

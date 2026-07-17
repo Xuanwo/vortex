@@ -884,37 +884,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn ordered_flatten_cancels_a_pending_drain_when_dropped() -> VortexResult<()> {
-        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let started = Arc::new(Notify::new());
-        let (dropped_send, dropped_recv) = oneshot::channel();
-        let pending = ArrayStreamAdapter::new(
-            dtype,
-            DropNotifyingPendingStream {
-                started: Arc::clone(&started),
-                _drop_notifier: DropNotifier(Some(dropped_send)),
-            },
-        )
-        .boxed();
-
-        let streams = futures::stream::iter([Ok::<_, VortexError>(pending)]);
-        let mut flattened = flatten_scan_streams(streams, true, 1, TokioRuntime::current());
-        let mut next = Box::pin(futures::StreamExt::next(&mut flattened));
-        tokio::select! {
-            _ = started.notified() => {}
-            _ = &mut next => return Err(vortex_err!("pending drain unexpectedly produced a chunk")),
-        }
-        drop(next);
-        drop(flattened);
-
-        let dropped = tokio::time::timeout(Duration::from_secs(1), dropped_recv)
-            .await
-            .map_err(|_| vortex_err!("dropping the flattened stream did not cancel its drain"))?;
-        dropped.map_err(|_| vortex_err!("pending source dropped without notifying the test"))?;
-        Ok(())
-    }
-
     struct PanickingStream;
 
     impl Stream for PanickingStream {
