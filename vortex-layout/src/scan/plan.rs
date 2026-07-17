@@ -50,21 +50,6 @@ pub(crate) struct TaskFuture {
     inner: BoxFuture<'static, TaskResult>,
 }
 
-#[derive(Clone, Copy)]
-enum ErrorDisposition {
-    Recoverable,
-    Terminal,
-}
-
-impl ErrorDisposition {
-    fn result(self, error: VortexError) -> TaskResult {
-        match self {
-            Self::Recoverable => TaskResult::Recoverable(error),
-            Self::Terminal => TaskResult::Terminal(error),
-        }
-    }
-}
-
 impl TaskFuture {
     pub(crate) fn new(future: impl Future<Output = TaskResult> + Send + 'static) -> Self {
         Self {
@@ -88,11 +73,12 @@ impl TaskFuture {
         Self::ready(TaskResult::Terminal(error))
     }
 
-    fn projection(projection: ArrayFuture, errors: ErrorDisposition) -> Self {
+    fn projection(projection: ArrayFuture, terminal: bool) -> Self {
         Self::new(async move {
             match projection.await {
                 Ok(array) => TaskResult::Array(Some(array)),
-                Err(error) => errors.result(error),
+                Err(error) if terminal => TaskResult::Terminal(error),
+                Err(error) => TaskResult::Recoverable(error),
             }
         })
     }
@@ -133,25 +119,33 @@ impl TaskFuture {
                 return TaskResult::Array(None);
             }
 
-            Self::deferred_projection(ctx, row_range, mask).await
+            run_deferred_projection(ctx, row_range, mask).await
         })
     }
 
     fn deferred_projection(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> Self {
-        Self::new(async move {
-            let projection = match ctx.reader.projection_evaluation(
-                &row_range,
-                &ctx.projection,
-                MaskFuture::ready(mask),
-            ) {
-                Ok(projection) => projection,
-                Err(error) => return TaskResult::Terminal(error),
-            };
-            match projection.await {
-                Ok(array) => TaskResult::Array(Some(array)),
-                Err(error) => TaskResult::Terminal(error),
-            }
-        })
+        Self::new(run_deferred_projection(ctx, row_range, mask))
+    }
+}
+
+/// Construct and run the projection for an already-reserved mask, classifying any failure as
+/// terminal (rows have been reserved and cannot be released back to a concurrent limit).
+async fn run_deferred_projection(
+    ctx: Arc<TaskContext>,
+    row_range: Range<u64>,
+    mask: Mask,
+) -> TaskResult {
+    let projection =
+        match ctx
+            .reader
+            .projection_evaluation(&row_range, &ctx.projection, MaskFuture::ready(mask))
+        {
+            Ok(projection) => projection,
+            Err(error) => return TaskResult::Terminal(error),
+        };
+    match projection.await {
+        Ok(array) => TaskResult::Array(Some(array)),
+        Err(error) => TaskResult::Terminal(error),
     }
 }
 
@@ -242,12 +236,7 @@ pub(crate) fn split_exec(
             Err(err) if limited => return Ok(TaskFuture::terminal(err)),
             Err(err) => return Err(err),
         };
-        let errors = if limited {
-            ErrorDisposition::Terminal
-        } else {
-            ErrorDisposition::Recoverable
-        };
-        return Ok(TaskFuture::projection(projection, errors));
+        return Ok(TaskFuture::projection(projection, limited));
     };
 
     let filter_mask = build_filter_mask(&ctx.reader, filter, &row_range, row_mask);
