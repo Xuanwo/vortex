@@ -97,10 +97,15 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
+use futures::stream::BoxStream;
+use tokio_stream::wrappers::ReceiverStream;
+use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
+use vortex::array::stream::SendableArrayStream;
 use vortex::dtype::DType;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
+use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::expr::Expression;
@@ -110,6 +115,7 @@ use vortex::expr::pack;
 use vortex::expr::root;
 use vortex::expr::stats::Precision;
 use vortex::expr::transform::replace;
+use vortex::io::runtime::Handle;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::scan::ScanRequest;
@@ -402,6 +408,7 @@ impl DataSource for VortexDataSource {
         ));
         let session = self.session.clone();
         let num_partitions = self.num_partitions;
+        let ordered = self.ordered;
 
         // Pre-build the leftover projector (if any) so we can apply it after batch conversion.
         let leftover_projector = self
@@ -418,17 +425,18 @@ impl DataSource for VortexDataSource {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Each split.execute() returns a lazy stream whose early polls do preparation
-            // work (expression resolution, layout traversal, first I/O spawns). We use
-            // try_flatten_unordered to poll multiple split streams concurrently so that
-            // the next split is already warm when the current one finishes.
+            // work (expression resolution, layout traversal, first I/O spawns). Both ordering
+            // modes flatten with cross-partition I/O look-ahead; the ordered path additionally
+            // preserves partition order so an ordered global limit cannot observe later rows first.
             let scan_streams = scan.partitions().map(|split_result| {
                 let split = split_result?;
                 split.execute()
             });
 
             let handle = session.handle();
-            let stream = scan_streams
-                .try_flatten_unordered(Some(num_partitions * 2))
+            let chunks =
+                flatten_scan_streams(scan_streams, ordered, num_partitions * 2, handle.clone());
+            let stream = chunks
                 .map(move |result| {
                     let session = session.clone();
                     let target_field = Arc::clone(&projected_target_field);
@@ -654,6 +662,54 @@ impl DataSource for VortexDataSource {
     }
 }
 
+fn flatten_scan_streams<S>(
+    scan_streams: S,
+    ordered: bool,
+    concurrency: usize,
+    handle: Handle,
+) -> BoxStream<'static, VortexResult<ArrayRef>>
+where
+    S: futures::Stream<Item = VortexResult<SendableArrayStream>> + Send + 'static,
+{
+    if !ordered {
+        return scan_streams
+            .try_flatten_unordered(Some(concurrency))
+            .boxed();
+    }
+
+    // Ordered output must preserve global row order, but later partitions should still warm up
+    // (start their I/O) while an earlier one is draining. Each partition is drained by a spawned
+    // task into a bounded channel: spawning starts its I/O immediately, and the bounded channel
+    // back-pressures so read-ahead stays capped. `buffered` warms up to `concurrency` partitions
+    // ahead while `try_flatten` emits their chunks strictly in partition order. At most
+    // `concurrency * CHUNKS_AHEAD` chunks are buffered across the warming partitions.
+    const CHUNKS_AHEAD: usize = 2;
+    let lookahead = concurrency.max(1);
+    scan_streams
+        .map(move |stream_result| {
+            let handle = handle.clone();
+            async move {
+                let mut stream = stream_result?;
+                let (tx, rx) = tokio::sync::mpsc::channel(CHUNKS_AHEAD);
+                handle
+                    .spawn(async move {
+                        while let Some(item) = stream.next().await {
+                            // A send error means the consumer was dropped (for example once a
+                            // global limit is reached), so stop draining and release the I/O.
+                            if tx.send(item).await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                Ok::<_, VortexError>(ReceiverStream::new(rx))
+            }
+        })
+        .buffered(lookahead)
+        .try_flatten()
+        .boxed()
+}
+
 /// Convert a Vortex [`Option<Precision>`] to a DataFusion
 /// [`DataFusionPrecision`].
 ///
@@ -663,5 +719,128 @@ fn estimate_to_df_precision(est: &Precision<u64>) -> DFPrecision<usize> {
         Precision::Exact(v) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Inexact(v) => DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Absent => DFPrecision::Absent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    use futures::TryStreamExt;
+    use vortex::array::ArrayRef;
+    use vortex::array::IntoArray;
+    use vortex::array::VortexSessionExecute;
+    use vortex::array::array_session;
+    use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::stream::ArrayStreamAdapter;
+    use vortex::array::stream::ArrayStreamExt;
+    use vortex::dtype::DType;
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
+    use vortex::error::VortexError;
+    use vortex::error::VortexResult;
+    use vortex::io::runtime::tokio::TokioRuntime;
+
+    use super::flatten_scan_streams;
+
+    fn i32_stream(dtype: &DType, chunks: Vec<Vec<i32>>) -> super::SendableArrayStream {
+        let items = chunks
+            .into_iter()
+            .map(|values| Ok(PrimitiveArray::from_iter(values).into_array()))
+            .collect::<Vec<VortexResult<ArrayRef>>>();
+        ArrayStreamAdapter::new(dtype.clone(), futures::stream::iter(items)).boxed()
+    }
+
+    fn collect_i32(chunks: Vec<ArrayRef>) -> VortexResult<Vec<i32>> {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut values = Vec::new();
+        for chunk in chunks {
+            let primitive = chunk.execute::<PrimitiveArray>(&mut ctx)?;
+            values.extend(primitive.into_buffer::<i32>());
+        }
+        Ok(values)
+    }
+
+    #[tokio::test]
+    async fn ordered_flatten_preserves_partition_order() -> VortexResult<()> {
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let first = i32_stream(&dtype, vec![vec![0, 1], vec![2]]);
+        let second = i32_stream(&dtype, vec![vec![10, 11]]);
+
+        let streams =
+            futures::stream::iter([Ok::<_, VortexError>(first), Ok::<_, VortexError>(second)]);
+        let flattened = flatten_scan_streams(streams, true, 4, TokioRuntime::current());
+        let chunks = flattened.try_collect::<Vec<_>>().await?;
+
+        assert_eq!(collect_i32(chunks)?, [0, 1, 2, 10, 11]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_flatten_warms_later_partition_while_first_pending() -> VortexResult<()> {
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        // The first partition self-wakes `Pending` a few times, then yields one chunk and ends.
+        let first_done = Arc::new(AtomicBool::new(false));
+        let first_done_for_stream = Arc::clone(&first_done);
+        let mut pending_polls = 3usize;
+        let mut emitted = false;
+        let first = ArrayStreamAdapter::new(
+            dtype.clone(),
+            futures::stream::poll_fn(move |cx| -> Poll<Option<VortexResult<ArrayRef>>> {
+                if pending_polls > 0 {
+                    pending_polls -= 1;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                if !emitted {
+                    emitted = true;
+                    return Poll::Ready(Some(Ok(PrimitiveArray::from_iter([0i32]).into_array())));
+                }
+                first_done_for_stream.store(true, Ordering::SeqCst);
+                Poll::Ready(None)
+            }),
+        )
+        .boxed();
+
+        // The second partition records, at its first poll, whether the first had already finished.
+        // 0 = not yet polled, 1 = first still running, 2 = first already done.
+        let observation = Arc::new(AtomicU8::new(0));
+        let observation_for_stream = Arc::clone(&observation);
+        let first_done_for_second = Arc::clone(&first_done);
+        let mut first_poll = true;
+        let second = ArrayStreamAdapter::new(
+            dtype,
+            futures::stream::poll_fn(move |_| -> Poll<Option<VortexResult<ArrayRef>>> {
+                if first_poll {
+                    first_poll = false;
+                    let seen = if first_done_for_second.load(Ordering::SeqCst) {
+                        2
+                    } else {
+                        1
+                    };
+                    observation_for_stream.store(seen, Ordering::SeqCst);
+                    return Poll::Ready(Some(Ok(PrimitiveArray::from_iter([100i32]).into_array())));
+                }
+                Poll::Ready(None)
+            }),
+        )
+        .boxed();
+
+        let streams =
+            futures::stream::iter([Ok::<_, VortexError>(first), Ok::<_, VortexError>(second)]);
+        let flattened = flatten_scan_streams(streams, true, 4, TokioRuntime::current());
+        let chunks = flattened.try_collect::<Vec<_>>().await?;
+
+        // Global order is preserved: the first partition's row precedes the later partition's.
+        assert_eq!(collect_i32(chunks)?, [0, 100]);
+        // The later partition was polled (warmed) while the first was still pending, proving the
+        // ordered flatten keeps cross-partition look-ahead instead of serializing.
+        assert_eq!(observation.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

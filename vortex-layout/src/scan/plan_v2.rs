@@ -16,6 +16,7 @@ use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::replace;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -24,6 +25,7 @@ use vortex_scan::row_mask::RowMask;
 use crate::ArrayFuture;
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
+use crate::scan::limit::RowLimit;
 
 pub(crate) struct PlanV2 {
     projection: ScanPlanRef,
@@ -215,105 +217,160 @@ fn parse_scan_impl(value: &str) -> VortexResult<bool> {
 pub(crate) fn split_exec(
     ctx: Arc<TaskContext>,
     read_mask: RowMask,
-    limit: Option<&mut u64>,
+    row_limit: Option<RowLimit>,
 ) -> VortexResult<BoxFuture<'static, VortexResult<Option<ArrayRef>>>> {
     let row_range = read_mask.row_range();
     let row_mask = read_mask.mask().clone();
 
-    let filter_mask = match ctx.filter.as_ref() {
-        None => {
-            let row_mask = match limit {
-                Some(l) if *l == 0 => Mask::new_false(row_mask.len()),
-                Some(l) => {
-                    let true_count = row_mask.true_count();
-                    let mask_limit = usize::try_from(*l)
-                        .map(|l| l.min(true_count))
-                        .unwrap_or(true_count);
-                    let row_mask = row_mask.limit(mask_limit);
-                    *l -= mask_limit as u64;
-                    row_mask
-                }
-                None => row_mask,
-            };
-
-            MaskFuture::ready(row_mask)
+    let Some(filter) = ctx.filter.as_ref() else {
+        let row_mask = if let Some(limit) = row_limit {
+            limit.limit(row_mask)
+        } else {
+            row_mask
+        };
+        if row_mask.all_false() {
+            return Ok(async { Ok(None) }.boxed());
         }
-        Some(filter) => {
-            if filter.conjuncts().len() != ctx.predicates.len() {
-                vortex_bail!(
-                    "physical predicate count {} does not match conjunct count {}",
-                    ctx.predicates.len(),
-                    filter.conjuncts().len()
-                );
-            }
 
-            let ctx = Arc::clone(&ctx);
-            let filter = Arc::clone(filter);
-            let row_range = row_range.clone();
-
-            MaskFuture::new(row_mask.len(), async move {
-                let mut mask = row_mask;
-                let mut dynamic_versions = vec![None; filter.conjuncts().len()];
-
-                for (idx, predicate) in ctx.predicates.iter().enumerate() {
-                    if mask.all_false() {
-                        return Ok(mask);
-                    }
-
-                    dynamic_versions[idx] = filter.dynamic_updates(idx).map(|du| du.version());
-                    let conjunct_mask = predicate
-                        .pruning_evaluation(&row_range, mask.clone())?
-                        .await?;
-                    mask = mask.bitand(&conjunct_mask);
-                }
-
-                let mut remaining = BitVec::from_elem(filter.conjuncts().len(), true);
-                while let Some(idx) = filter.next_conjunct(&remaining) {
-                    remaining.set(idx, false);
-                    if mask.all_false() {
-                        return Ok(mask);
-                    }
-
-                    let current_version = filter.dynamic_updates(idx).map(|du| du.version());
-                    if let Some(version) = current_version
-                        && dynamic_versions[idx].is_none_or(|old| old < version)
-                    {
-                        dynamic_versions[idx] = Some(version);
-                        let conjunct_mask = ctx.predicates[idx]
-                            .pruning_evaluation(&row_range, mask.clone())?
-                            .await?;
-                        mask = mask.bitand(&conjunct_mask);
-                    }
-                    if mask.all_false() {
-                        return Ok(mask);
-                    }
-
-                    let conjunct_mask = ctx.predicates[idx]
-                        .filter_evaluation(&row_range, MaskFuture::ready(mask))?
-                        .await?;
-                    filter.report_selectivity(idx, conjunct_mask.density());
-                    mask = conjunct_mask;
-                }
-
-                Ok(mask)
-            })
-        }
+        let projection = ctx
+            .projection
+            .projection_evaluation(&row_range, MaskFuture::ready(row_mask))?;
+        return Ok(async move { projection.await.map(Some) }.boxed());
     };
 
-    let projection_future = ctx
-        .projection
-        .projection_evaluation(&row_range, filter_mask.clone())?;
+    validate_predicates(&ctx, filter)?;
+    let filter_mask = build_filter_mask(&ctx, filter, &row_range, row_mask);
+
+    let Some(row_limit) = row_limit else {
+        let projection = ctx
+            .projection
+            .projection_evaluation(&row_range, filter_mask.clone())?;
+        return Ok(async move {
+            let mask = filter_mask.await?;
+            if mask.all_false() {
+                return Ok(None);
+            }
+
+            projection.await.map(Some)
+        }
+        .boxed());
+    };
 
     let array_fut = async move {
-        let mask = filter_mask.await?;
+        let mask = row_limit.limit(filter_mask.await?);
         if mask.all_false() {
             return Ok(None);
         }
 
-        projection_future.await.map(Some)
+        let projection = ctx
+            .projection
+            .projection_evaluation(&row_range, MaskFuture::ready(mask))?;
+        projection.await.map(Some)
     };
 
     Ok(array_fut.boxed())
+}
+
+pub(crate) fn filter_split(
+    ctx: Arc<TaskContext>,
+    read_mask: RowMask,
+) -> BoxFuture<'static, VortexResult<(Range<u64>, Mask)>> {
+    let row_range = read_mask.row_range();
+    let row_mask = read_mask.mask().clone();
+    let filter = ctx
+        .filter
+        .as_ref()
+        .vortex_expect("filter_split requires a filtered scan");
+    if let Err(err) = validate_predicates(&ctx, filter) {
+        return async move { Err(err) }.boxed();
+    }
+    let filter_mask = build_filter_mask(&ctx, filter, &row_range, row_mask);
+
+    async move {
+        let mask = filter_mask.await?;
+        Ok((row_range, mask))
+    }
+    .boxed()
+}
+
+pub(crate) fn project_split(
+    ctx: Arc<TaskContext>,
+    row_range: Range<u64>,
+    mask: Mask,
+) -> VortexResult<BoxFuture<'static, VortexResult<Option<ArrayRef>>>> {
+    let projection = ctx
+        .projection
+        .projection_evaluation(&row_range, MaskFuture::ready(mask))?;
+    Ok(async move { projection.await.map(Some) }.boxed())
+}
+
+fn validate_predicates(ctx: &TaskContext, filter: &FilterExpr) -> VortexResult<()> {
+    if filter.conjuncts().len() != ctx.predicates.len() {
+        vortex_bail!(
+            "physical predicate count {} does not match conjunct count {}",
+            ctx.predicates.len(),
+            filter.conjuncts().len()
+        );
+    }
+    Ok(())
+}
+
+fn build_filter_mask(
+    ctx: &Arc<TaskContext>,
+    filter: &Arc<FilterExpr>,
+    row_range: &Range<u64>,
+    row_mask: Mask,
+) -> MaskFuture {
+    let ctx = Arc::clone(ctx);
+    let filter = Arc::clone(filter);
+    let row_range = row_range.clone();
+
+    MaskFuture::new(row_mask.len(), async move {
+        let mut mask = row_mask;
+        let mut dynamic_versions = vec![None; filter.conjuncts().len()];
+
+        for (idx, predicate) in ctx.predicates.iter().enumerate() {
+            if mask.all_false() {
+                return Ok(mask);
+            }
+
+            dynamic_versions[idx] = filter.dynamic_updates(idx).map(|du| du.version());
+            let conjunct_mask = predicate
+                .pruning_evaluation(&row_range, mask.clone())?
+                .await?;
+            mask = mask.bitand(&conjunct_mask);
+        }
+
+        let mut remaining = BitVec::from_elem(filter.conjuncts().len(), true);
+        while let Some(idx) = filter.next_conjunct(&remaining) {
+            remaining.set(idx, false);
+            if mask.all_false() {
+                return Ok(mask);
+            }
+
+            let current_version = filter.dynamic_updates(idx).map(|du| du.version());
+            if let Some(version) = current_version
+                && dynamic_versions[idx].is_none_or(|old| old < version)
+            {
+                dynamic_versions[idx] = Some(version);
+                let conjunct_mask = ctx.predicates[idx]
+                    .pruning_evaluation(&row_range, mask.clone())?
+                    .await?;
+                mask = mask.bitand(&conjunct_mask);
+            }
+            if mask.all_false() {
+                return Ok(mask);
+            }
+
+            let conjunct_mask = ctx.predicates[idx]
+                .filter_evaluation(&row_range, MaskFuture::ready(mask))?
+                .await?;
+            filter.report_selectivity(idx, conjunct_mask.density());
+            mask = conjunct_mask;
+        }
+
+        Ok(mask)
+    })
 }
 
 /// Information needed to execute one split from a V2 physical scan plan.

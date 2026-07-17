@@ -36,6 +36,7 @@ use vortex_session::VortexSession;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
+use crate::scan::limit::RowLimit;
 use crate::scan::plan_v2::LayoutReaderScanPlanV2;
 use crate::scan::plan_v2::ScanPlanRef;
 use crate::scan::plan_v2::plan_v2_enabled;
@@ -74,6 +75,8 @@ pub struct ScanBuilder {
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
     /// Maximal number of rows to read after filtering.
     limit: Option<u64>,
+    /// A row limit shared with sibling external partitions, when the caller owns one.
+    row_limit: Option<RowLimit>,
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
     row_offset: u64,
@@ -96,6 +99,7 @@ impl ScanBuilder {
             concurrency: 4,
             metrics_registry: None,
             limit: None,
+            row_limit: None,
             row_offset: 0,
         }
     }
@@ -220,6 +224,12 @@ impl ScanBuilder {
         self
     }
 
+    /// Use a row limit supplied by the enclosing data source instead of creating a local one.
+    pub(crate) fn with_some_row_limit(mut self, row_limit: Option<RowLimit>) -> Self {
+        self.row_limit = row_limit;
+        self
+    }
+
     /// The [`DType`] returned by the scan, after applying the projection.
     pub fn dtype(&self) -> VortexResult<DType> {
         self.projection.return_dtype(self.layout_reader.dtype())
@@ -296,6 +306,7 @@ impl ScanBuilder {
                 splits,
                 self.concurrency,
                 self.limit,
+                self.row_limit,
                 dtype,
             ));
         }
@@ -311,6 +322,7 @@ impl ScanBuilder {
             splits,
             self.concurrency,
             self.limit,
+            self.row_limit,
             dtype,
         ))
     }
@@ -903,6 +915,197 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct ProjectionMaskLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+        row_count: u64,
+        projection_masks: Arc<Mutex<Vec<usize>>>,
+        projection_error: bool,
+    }
+
+    impl ProjectionMaskLayoutReader {
+        fn new(row_count: u64, projection_masks: Arc<Mutex<Vec<usize>>>) -> Self {
+            Self {
+                name: Arc::from("projection-mask"),
+                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+                row_count,
+                projection_masks,
+                projection_error: false,
+            }
+        }
+
+        fn with_projection_error(mut self) -> Self {
+            self.projection_error = true;
+            self
+        }
+    }
+
+    impl LayoutReader for ProjectionMaskLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            self.row_count
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            let row_range = row_range.clone();
+            let projection_masks = Arc::clone(&self.projection_masks);
+            let projection_error = self.projection_error;
+
+            Ok(Box::pin(async move {
+                let mask = mask.await?;
+                projection_masks.lock().push(mask.true_count());
+                if projection_error {
+                    return Err(vortex_err!("projection failed"));
+                }
+                let start = i32::try_from(row_range.start)
+                    .map_err(|_| vortex_err!("row_range.start must fit in i32"))?;
+                let end = i32::try_from(row_range.end)
+                    .map_err(|_| vortex_err!("row_range.end must fit in i32"))?;
+                PrimitiveArray::from_iter(start..end)
+                    .into_array()
+                    .filter(mask)
+            }))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorThenMatchLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+        projection_masks: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ErrorThenMatchLayoutReader {
+        fn new(projection_masks: Arc<Mutex<Vec<usize>>>) -> Self {
+            Self {
+                name: Arc::from("error-then-match"),
+                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+                projection_masks,
+            }
+        }
+    }
+
+    impl LayoutReader for ErrorThenMatchLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            2
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            let row_range = split_range.row_range();
+            splits.push(split_range.row_offset() + row_range.start + 1);
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            if row_range.start == 0 {
+                let len = mask.len();
+                return Ok(MaskFuture::new(len, async move {
+                    Err(vortex_err!("first split filter failed"))
+                }));
+            }
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            let row_range = row_range.clone();
+            let projection_masks = Arc::clone(&self.projection_masks);
+
+            Ok(Box::pin(async move {
+                let mask = mask.await?;
+                projection_masks.lock().push(mask.true_count());
+                let start = i32::try_from(row_range.start)
+                    .map_err(|_| vortex_err!("row_range.start must fit in i32"))?;
+                let end = i32::try_from(row_range.end)
+                    .map_err(|_| vortex_err!("row_range.end must fit in i32"))?;
+                PrimitiveArray::from_iter(start..end)
+                    .into_array()
+                    .filter(mask)
+            }))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     fn collect_scan_values<I>(iter: I) -> VortexResult<Vec<i32>>
     where
         I: IntoIterator<Item = VortexResult<ArrayRef>>,
@@ -945,6 +1148,77 @@ mod test {
         drain_runtime(&runtime);
 
         assert_eq!(values, [0, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_limit_limits_projection_mask_before_projection() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let projection_masks = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(ProjectionMaskLayoutReader::new(
+            100_000,
+            Arc::clone(&projection_masks),
+        ));
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(1)
+            .into_stream()?;
+        let values = collect_scan_values(runtime.block_on_stream(stream))?;
+
+        assert_eq!(values, [0]);
+        assert_eq!(projection_masks.lock().as_slice(), [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_errors_are_stream_items_and_do_not_consume_the_limit() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let projection_masks = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(ErrorThenMatchLayoutReader::new(Arc::clone(
+            &projection_masks,
+        )));
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(1)
+            .into_stream()?;
+        let mut iter = runtime.block_on_stream(stream);
+
+        assert!(matches!(iter.next(), Some(Err(_))));
+        let Some(chunk) = iter.next() else {
+            return Err(vortex_err!(
+                "matching split was not polled after the filter error"
+            ));
+        };
+        let mut ctx = array_session().create_execution_ctx();
+        let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
+
+        assert_eq!(primitive.into_buffer::<i32>().as_slice(), [1]);
+        assert!(iter.next().is_none());
+        assert_eq!(projection_masks.lock().as_slice(), [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_errors_are_stream_items() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let projection_masks = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(
+            ProjectionMaskLayoutReader::new(1, Arc::clone(&projection_masks))
+                .with_projection_error(),
+        );
+        let stream = ScanBuilder::new(session, reader)
+            .with_filter(root())
+            .with_limit(1)
+            .into_stream()?;
+        let mut iter = runtime.block_on_stream(stream);
+
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
+        assert_eq!(projection_masks.lock().as_slice(), [1]);
         Ok(())
     }
 
