@@ -31,6 +31,7 @@ use crate::validity::Validity;
 
 pub(crate) mod byte_compress;
 
+mod simd_compress;
 mod slice;
 mod take;
 
