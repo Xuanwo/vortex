@@ -124,6 +124,10 @@ uint32_t DataType::fixed_size_list_size() const {
     return vx_dtype_fixed_size_list_size(handle_.get());
 }
 
+uint32_t DataType::fixed_size_binary_size() const {
+    return vx_dtype_fixed_size_binary_size(handle_.get());
+}
+
 namespace dtype {
 
 DataType null() {
@@ -173,6 +177,9 @@ DataType utf8(bool nullable) {
 }
 DataType binary(bool nullable) {
     return Access::adopt<DataType>(vx_dtype_new_binary(nullable));
+}
+DataType fixed_size_binary(uint32_t byte_width, bool nullable) {
+    return Access::adopt<DataType>(vx_dtype_new_fixed_size_binary(byte_width, nullable));
 }
 DataType decimal(uint8_t precision, int8_t scale, bool nullable) {
     return Access::adopt<DataType>(vx_dtype_new_decimal(precision, scale, nullable));

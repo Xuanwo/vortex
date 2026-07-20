@@ -37,6 +37,8 @@ enum class DataTypeVariant {
     Decimal = DTYPE_DECIMAL,
     // Nested fixed-size list
     FixedSizeList = DTYPE_FIXED_SIZE_LIST,
+    // Fixed-size binary data
+    FixedSizeBinary = DTYPE_FIXED_SIZE_BINARY,
 };
 
 // Primitive type
@@ -95,6 +97,7 @@ public:
     DataType list_element() const;
     DataType fixed_size_list_element() const;
     uint32_t fixed_size_list_size() const;
+    uint32_t fixed_size_binary_size() const;
 
 private:
     friend struct detail::Access;
@@ -135,6 +138,7 @@ DataType float32(bool nullable = false);
 DataType float64(bool nullable = false);
 DataType utf8(bool nullable = false);
 DataType binary(bool nullable = false);
+DataType fixed_size_binary(uint32_t byte_width, bool nullable = false);
 DataType decimal(uint8_t precision, int8_t scale, bool nullable = false);
 DataType list(DataType element, bool nullable = false);
 DataType fixed_size_list(DataType element, uint32_t size, bool nullable = false);

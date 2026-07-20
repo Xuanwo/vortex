@@ -26,6 +26,13 @@ TEST_CASE("Decimal dtype", "[dtype]") {
     REQUIRE_THROWS_AS(d.list_element(), VortexException);
 }
 
+TEST_CASE("Fixed-size binary dtype", "[dtype]") {
+    auto d = dtype::fixed_size_binary(16, dtype::Nullable);
+    REQUIRE(d.variant() == DataTypeVariant::FixedSizeBinary);
+    REQUIRE(d.fixed_size_binary_size() == 16);
+    REQUIRE(d.nullable());
+}
+
 TEST_CASE("copy dtype", "[dtype]") {
     auto d = dtype::int32(true);
     DataType d2 = d;

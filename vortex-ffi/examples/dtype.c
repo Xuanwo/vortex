@@ -86,6 +86,10 @@ void print_decimal_dtype(const vx_dtype *dtype) {
     printf("decimal(precision=%u, scale=%d)", precision, scale);
 }
 
+void print_fixed_size_binary_dtype(const vx_dtype *dtype) {
+    printf("fixed binary(size=%u)", vx_dtype_fixed_size_binary_size(dtype));
+}
+
 void print_dtype(const vx_dtype *dtype) {
     switch (vx_dtype_get_variant(dtype)) {
     case DTYPE_NULL:
@@ -117,6 +121,9 @@ void print_dtype(const vx_dtype *dtype) {
         break;
     case DTYPE_DECIMAL:
         print_decimal_dtype(dtype);
+        break;
+    case DTYPE_FIXED_SIZE_BINARY:
+        print_fixed_size_binary_dtype(dtype);
         break;
     }
     printf("%c\n", vx_dtype_is_nullable(dtype) ? '?' : ' ');
