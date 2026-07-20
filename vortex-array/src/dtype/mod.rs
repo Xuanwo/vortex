@@ -90,6 +90,9 @@ pub enum DType {
     /// Logical binary data.
     Binary(Nullability),
 
+    /// Logical binary data whose values all have the same byte width.
+    FixedSizeBinary(u32, Nullability),
+
     /// A logical variable-length list type.
     ///
     /// This is parameterized by a single `DType` that represents the element type of the inner
@@ -141,6 +144,7 @@ impl PartialEq for DType {
             (Self::Decimal(da, na), Self::Decimal(db, nb)) => da == db && na == nb,
             (Self::Utf8(a), Self::Utf8(b)) => a == b,
             (Self::Binary(a), Self::Binary(b)) => a == b,
+            (Self::FixedSizeBinary(sa, na), Self::FixedSizeBinary(sb, nb)) => sa == sb && na == nb,
             (Self::List(da, na), Self::List(db, nb)) => {
                 na == nb && (Arc::ptr_eq(da, db) || da == db)
             }
@@ -161,6 +165,7 @@ impl PartialEq for DType {
             | (Self::Decimal(..), _)
             | (Self::Utf8(_), _)
             | (Self::Binary(_), _)
+            | (Self::FixedSizeBinary(..), _)
             | (Self::List(..), _)
             | (Self::FixedSizeList(..), _)
             | (Self::Struct(..), _)

@@ -1236,7 +1236,7 @@ fn test_cast_slice_consistency(array: &ArrayRef, ctx: &mut ExecutionCtx) {
         }
         DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
         DType::Variant(_) => unimplemented!(),
-        DType::Extension(_) => vec![], // Extension types typically only cast to themselves
+        DType::FixedSizeBinary(..) | DType::Extension(_) => vec![], /* These types typically only cast to themselves */
     };
 
     // Test each target dtype

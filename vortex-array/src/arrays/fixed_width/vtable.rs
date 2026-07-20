@@ -6,6 +6,10 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
+use crate::ArrayRef;
+use crate::array::ArrayView;
+use crate::array::VTable;
+use crate::array::child_to_validity;
 use crate::buffer::BufferHandle;
 use crate::dtype::Nullability;
 use crate::serde::ArrayChildren;
@@ -43,5 +47,18 @@ pub(crate) fn deserialize_validity(
         0 => Ok(Validity::from(nullability)),
         1 => Ok(Validity::Array(children.get(0, &Validity::DTYPE, len)?)),
         child_count => vortex_bail!("Expected 0 or 1 child, got {child_count}"),
+    }
+}
+pub(crate) fn validity<V: VTable>(array: ArrayView<'_, V>) -> VortexResult<Validity> {
+    Ok(child_to_validity(
+        array.slots()[0].as_ref(),
+        array.dtype().nullability(),
+    ))
+}
+
+pub(crate) fn slot_name(idx: usize) -> String {
+    match idx {
+        0 => "validity".to_string(),
+        _ => vortex_panic!("Fixed-width slot index {idx} out of bounds"),
     }
 }

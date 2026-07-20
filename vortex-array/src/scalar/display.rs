@@ -17,7 +17,9 @@ impl Display for Scalar {
             DType::Primitive(..) => write!(f, "{}", self.as_primitive()),
             DType::Decimal(..) => write!(f, "{}", self.as_decimal()),
             DType::Utf8(_) => write!(f, "{}", self.as_utf8()),
-            DType::Binary(_) => write!(f, "{}", self.as_binary()),
+            DType::Binary(_) | DType::FixedSizeBinary(..) => {
+                write!(f, "{}", self.as_binary())
+            }
             DType::List(..) | DType::FixedSizeList(..) => write!(f, "{}", self.as_list()),
             DType::Struct(..) => write!(f, "{}", self.as_struct()),
             DType::Union(..) => write!(f, "{}", self.as_union()),

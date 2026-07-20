@@ -13,6 +13,7 @@ use std::fmt::Formatter;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 use vortex_session::registry::CachedId;
 
 use self::bool::check_bool_sorted;
@@ -40,6 +41,44 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
+
+fn check_fixed_size_binary_sorted(
+    array: &crate::arrays::FixedSizeBinaryArray,
+    strict: bool,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<bool> {
+    let DType::FixedSizeBinary(byte_width, _) = array.dtype() else {
+        unreachable!()
+    };
+    let byte_width = *byte_width as usize;
+    let values = array.buffer_handle().to_host_sync();
+    let validity = array.as_ref().validity()?.execute_mask(array.len(), ctx)?;
+    let mut valid = match &validity {
+        Mask::AllTrue(len) => {
+            Box::new(std::iter::repeat_n(true, *len)) as Box<dyn Iterator<Item = bool>>
+        }
+        Mask::AllFalse(len) => Box::new(std::iter::repeat_n(false, *len)),
+        Mask::Values(values) => Box::new(values.bit_buffer().iter()),
+    };
+    let mut previous: Option<Option<&[u8]>> = None;
+    for index in 0..array.len() {
+        let current = valid.next().unwrap_or(false).then(|| {
+            let start = index * byte_width;
+            &values[start..start + byte_width]
+        });
+        if let Some(previous) = previous
+            && if strict {
+                previous >= current
+            } else {
+                previous > current
+            }
+        {
+            return Ok(false);
+        }
+        previous = Some(current);
+    }
+    Ok(true)
+}
 
 /// Options for the `is_sorted` aggregate function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -254,7 +293,8 @@ impl AggregateFnVTable for IsSorted {
             | DType::Primitive(..)
             | DType::Decimal(..)
             | DType::Utf8(_)
-            | DType::Binary(_) => Some(DType::Bool(Nullability::NonNullable)),
+            | DType::Binary(_)
+            | DType::FixedSizeBinary(..) => Some(DType::Bool(Nullability::NonNullable)),
         }
     }
 
@@ -271,7 +311,8 @@ impl AggregateFnVTable for IsSorted {
             | DType::Primitive(..)
             | DType::Decimal(..)
             | DType::Utf8(_)
-            | DType::Binary(_) => Some(make_is_sorted_partial_dtype(input_dtype)),
+            | DType::Binary(_)
+            | DType::FixedSizeBinary(..) => Some(make_is_sorted_partial_dtype(input_dtype)),
         }
     }
 
@@ -487,10 +528,13 @@ impl AggregateFnVTable for IsSorted {
 
                 // Check within-batch sortedness.
                 let batch_is_sorted = match c {
-                    Canonical::Primitive(p) => check_primitive_sorted(p, partial.strict, ctx)?,
+                    Canonical::Primitive(a) => check_primitive_sorted(a, partial.strict, ctx)?,
+                    Canonical::Decimal(a) => check_decimal_sorted(a, partial.strict, ctx)?,
+                    Canonical::FixedSizeBinary(a) => {
+                        check_fixed_size_binary_sorted(a, partial.strict, ctx)?
+                    }
                     Canonical::Bool(b) => check_bool_sorted(b, partial.strict, ctx)?,
                     Canonical::VarBinView(v) => check_varbinview_sorted(v, partial.strict, ctx)?,
-                    Canonical::Decimal(d) => check_decimal_sorted(d, partial.strict, ctx)?,
                     Canonical::Extension(e) => check_extension_sorted(e, partial.strict, ctx)?,
                     Canonical::Null(_) => !partial.strict,
                     // Struct, List, FixedSizeList should have been filtered out by return_dtype

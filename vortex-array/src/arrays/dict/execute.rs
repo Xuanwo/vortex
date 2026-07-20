@@ -47,6 +47,9 @@ pub(crate) fn take_canonical(
         Canonical::Bool(a) => Canonical::Bool(take_bool(&a, codes, ctx)?),
         Canonical::Primitive(a) => Canonical::Primitive(take_primitive(&a, codes, ctx)),
         Canonical::Decimal(a) => Canonical::Decimal(take_decimal(&a, codes, ctx)),
+        Canonical::FixedSizeBinary(a) => {
+            Canonical::FixedSizeBinary(take_fixed_size_binary(&a, codes, ctx))
+        }
         Canonical::VarBinView(a) => Canonical::VarBinView(take_varbinview(&a, codes, ctx)),
         Canonical::List(a) => Canonical::List(take_listview(&a, codes, ctx)),
         Canonical::FixedSizeList(a) => {
@@ -116,6 +119,19 @@ fn take_decimal(
         .vortex_expect("take decimal array")
         .vortex_expect("take decimal should not return None")
         .as_::<Decimal>()
+        .into_owned()
+}
+
+fn take_fixed_size_binary(
+    array: &crate::arrays::FixedSizeBinaryArray,
+    codes: &PrimitiveArray,
+    ctx: &mut ExecutionCtx,
+) -> crate::arrays::FixedSizeBinaryArray {
+    let codes_ref = codes.clone().into_array();
+    <crate::arrays::FixedSizeBinary as TakeExecute>::take(array.as_view(), &codes_ref, ctx)
+        .vortex_expect("take fixed-size binary array")
+        .vortex_expect("take fixed-size binary should not return None")
+        .as_::<crate::arrays::FixedSizeBinary>()
         .into_owned()
 }
 

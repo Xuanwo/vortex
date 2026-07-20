@@ -24,6 +24,7 @@ use crate::arrays::Bool;
 use crate::arrays::Constant;
 use crate::arrays::Decimal;
 use crate::arrays::Extension;
+use crate::arrays::FixedSizeBinary;
 use crate::arrays::FixedSizeList;
 use crate::arrays::ListView;
 use crate::arrays::Null;
@@ -195,6 +196,7 @@ fn cast_canonical(
         CanonicalView::Bool(a) => <Bool as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::Primitive(a) => <Primitive as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::Decimal(a) => <Decimal as CastKernel>::cast(a, dtype, ctx),
+        CanonicalView::FixedSizeBinary(a) => <FixedSizeBinary as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::VarBinView(a) => <VarBinView as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::List(a) => <ListView as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::FixedSizeList(a) => <FixedSizeList as CastKernel>::cast(a, dtype, ctx),

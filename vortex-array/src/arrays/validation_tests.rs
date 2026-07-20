@@ -17,9 +17,13 @@ mod tests {
 
     use crate::IntoArray;
     use crate::arrays::ChunkedArray;
+    use crate::arrays::Decimal;
     use crate::arrays::DecimalArray;
+    use crate::arrays::FixedSizeBinary;
+    use crate::arrays::FixedSizeBinaryArray;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListArray;
+    use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
@@ -88,6 +92,40 @@ mod tests {
 
         assert!(matches!(result, Err(VortexError::InvalidArgument(_, _))));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fixed_width_logical_types_have_distinct_vtables() {
+        let primitive = buffer![1i32, 2].into_array();
+        let decimal = DecimalArray::new(
+            Buffer::from_iter([1i128, 2]),
+            crate::dtype::DecimalDType::new(10, 2),
+            Validity::NonNullable,
+        )
+        .into_array();
+        let fixed_size_binary = FixedSizeBinaryArray::new(
+            ByteBuffer::from(vec![1u8, 2, 3, 4]),
+            2,
+            2,
+            Validity::NonNullable,
+        )
+        .into_array();
+
+        assert!(primitive.is::<Primitive>());
+        assert!(!primitive.is::<Decimal>());
+        assert!(!primitive.is::<FixedSizeBinary>());
+
+        assert!(decimal.is::<Decimal>());
+        assert!(!decimal.is::<Primitive>());
+        assert!(!decimal.is::<FixedSizeBinary>());
+
+        assert!(fixed_size_binary.is::<FixedSizeBinary>());
+        assert!(!fixed_size_binary.is::<Primitive>());
+        assert!(!fixed_size_binary.is::<Decimal>());
+
+        assert_ne!(primitive.encoding_id(), decimal.encoding_id());
+        assert_ne!(primitive.encoding_id(), fixed_size_binary.encoding_id());
+        assert_ne!(decimal.encoding_id(), fixed_size_binary.encoding_id());
     }
 
     #[test]

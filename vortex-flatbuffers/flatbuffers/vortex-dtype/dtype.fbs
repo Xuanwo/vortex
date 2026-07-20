@@ -40,6 +40,11 @@ table Binary {
     nullable: bool;
 }
 
+table FixedSizeBinary {
+    size: uint32;
+    nullable: bool;
+}
+
 table Struct_ {
     names: [string];
     dtypes: [DType];
@@ -87,6 +92,7 @@ union Type {
     FixedSizeList = 10, // This is after `Extension` for backwards compatibility.
     Variant = 11,
     Union = 12,
+    FixedSizeBinary = 13,
 }
 
 table DType {

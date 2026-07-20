@@ -32,6 +32,13 @@ pub struct Binary {
     #[prost(bool, tag = "1")]
     pub nullable: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FixedSizeBinary {
+    #[prost(uint32, tag = "1")]
+    pub size: u32,
+    #[prost(bool, tag = "2")]
+    pub nullable: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Struct {
     #[prost(string, repeated, tag = "1")]
@@ -85,7 +92,10 @@ pub struct Union {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DType {
-    #[prost(oneof = "d_type::DtypeType", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(
+        oneof = "d_type::DtypeType",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"
+    )]
     pub dtype_type: ::core::option::Option<d_type::DtypeType>,
 }
 /// Nested message and enum types in `DType`.
@@ -117,6 +127,8 @@ pub mod d_type {
         Variant(super::Variant),
         #[prost(message, tag = "12")]
         Union(super::Union),
+        #[prost(message, tag = "13")]
+        FixedSizeBinary(super::FixedSizeBinary),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

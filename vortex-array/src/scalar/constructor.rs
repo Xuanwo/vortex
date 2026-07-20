@@ -106,6 +106,18 @@ impl Scalar {
         .vortex_expect("unable to construct a binary `Scalar`")
     }
 
+    /// Creates a new fixed-size binary scalar from a byte buffer.
+    pub fn fixed_size_binary(buffer: impl Into<ByteBuffer>, nullability: Nullability) -> Self {
+        let buffer = buffer.into();
+        let size = u32::try_from(buffer.len())
+            .vortex_expect("fixed-size binary values must fit in a u32 byte width");
+        Self::try_new(
+            DType::FixedSizeBinary(size, nullability),
+            Some(ScalarValue::Binary(buffer)),
+        )
+        .vortex_expect("unable to construct a fixed-size binary `Scalar`")
+    }
+
     /// Creates a new list scalar with the given element type and children.
     ///
     /// # Panics

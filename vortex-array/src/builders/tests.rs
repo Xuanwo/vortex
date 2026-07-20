@@ -607,6 +607,9 @@ fn create_test_scalars_for_dtype(dtype: &DType, count: usize) -> Vec<Scalar> {
             }
             DType::Utf8(n) => Scalar::utf8(format!("test_string_{}", i), *n),
             DType::Binary(n) => Scalar::binary(format!("bytes_{}", i).into_bytes(), *n),
+            DType::FixedSizeBinary(size, n) => {
+                Scalar::fixed_size_binary(vec![i as u8; *size as usize], *n)
+            }
             DType::List(element_dtype, n) => {
                 // Create list scalars with a few elements.
                 let elements: Vec<Scalar> = (0..=i)

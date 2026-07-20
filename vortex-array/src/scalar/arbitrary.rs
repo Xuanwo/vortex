@@ -64,6 +64,15 @@ pub fn random_scalar(u: &mut Unstructured, dtype: &DType) -> Result<Scalar> {
             ))),
         )
         .vortex_expect("unable to construct random `Scalar`_"),
+        DType::FixedSizeBinary(size, _) => Scalar::try_new(
+            dtype.clone(),
+            Some(ScalarValue::Binary(ByteBuffer::from(
+                (0..*size)
+                    .map(|_| u.arbitrary::<u8>())
+                    .collect::<Result<Vec<_>>>()?,
+            ))),
+        )
+        .vortex_expect("unable to construct random `Scalar`_"),
         DType::List(edt, _) => Scalar::try_new(
             dtype.clone(),
             Some(ScalarValue::Tuple(

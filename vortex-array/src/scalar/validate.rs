@@ -74,6 +74,17 @@ impl Scalar {
                     "binary dtype expected Binary value, got {value}",
                 );
             }
+            DType::FixedSizeBinary(size, _) => {
+                let ScalarValue::Binary(buffer) = value else {
+                    vortex_bail!("fixed-size binary dtype expected Binary value, got {value}");
+                };
+                vortex_ensure_eq!(
+                    buffer.len(),
+                    *size as usize,
+                    "fixed-size binary dtype expected {size} bytes, got {}",
+                    buffer.len(),
+                );
+            }
             DType::List(elem_dtype, _) => {
                 let ScalarValue::Tuple(elements) = value else {
                     vortex_bail!("list dtype expected Tuple value, got {value}");

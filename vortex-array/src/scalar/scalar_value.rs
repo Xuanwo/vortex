@@ -60,6 +60,7 @@ impl ScalarValue {
             DType::Decimal(dt, ..) => Self::Decimal(DecimalValue::zero(dt)),
             DType::Utf8(_) => Self::Utf8(BufferString::empty()),
             DType::Binary(_) => Self::Binary(ByteBuffer::empty()),
+            DType::FixedSizeBinary(size, _) => Self::Binary(ByteBuffer::zeroed(*size as usize)),
             DType::List(..) => Self::Tuple(vec![]),
             DType::FixedSizeList(edt, size, _) => {
                 let elements = (0..*size)
@@ -111,6 +112,7 @@ impl ScalarValue {
             DType::Decimal(dt, ..) => Self::Decimal(DecimalValue::zero(dt)),
             DType::Utf8(_) => Self::Utf8(BufferString::empty()),
             DType::Binary(_) => Self::Binary(ByteBuffer::empty()),
+            DType::FixedSizeBinary(size, _) => Self::Binary(ByteBuffer::zeroed(*size as usize)),
             DType::List(..) => Self::Tuple(vec![]),
             DType::FixedSizeList(edt, size, _) => {
                 let elements = (0..*size)

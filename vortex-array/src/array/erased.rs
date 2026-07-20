@@ -804,3 +804,41 @@ impl<V: VTable> Matcher for V {
         Some(unsafe { ArrayView::new_unchecked(array, &inner.data) })
     }
 }
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::buffer;
+
+    use super::*;
+    use crate::arrays::Decimal;
+    use crate::arrays::DecimalArray;
+    use crate::arrays::FixedSizeBinary;
+    use crate::arrays::FixedSizeBinaryArray;
+    use crate::arrays::Primitive;
+    use crate::dtype::DecimalDType;
+
+    #[test]
+    fn fixed_width_arrays_match_their_logical_vtable() {
+        let primitive = buffer![1i32].into_array();
+        let decimal = DecimalArray::new(
+            buffer![1i32],
+            DecimalDType::new(1, 0),
+            Validity::NonNullable,
+        )
+        .into_array();
+        let fixed_size_binary = FixedSizeBinaryArray::new(
+            buffer![1u8, 2].into_byte_buffer(),
+            2,
+            1,
+            Validity::NonNullable,
+        )
+        .into_array();
+
+        assert!(primitive.is::<Primitive>());
+        assert!(!primitive.is::<Decimal>());
+        assert!(decimal.is::<Decimal>());
+        assert!(!decimal.is::<Primitive>());
+        assert!(fixed_size_binary.is::<FixedSizeBinary>());
+        assert!(!fixed_size_binary.is::<Primitive>());
+        assert!(!fixed_size_binary.is::<Decimal>());
+    }
+}

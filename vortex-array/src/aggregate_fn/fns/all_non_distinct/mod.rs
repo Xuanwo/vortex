@@ -257,6 +257,10 @@ fn check_canonical_identical(
             check_primitive_identical(lhs, rhs)
         }
         (Canonical::Decimal(lhs), Canonical::Decimal(rhs)) => check_decimal_identical(lhs, rhs),
+        (Canonical::FixedSizeBinary(lhs), Canonical::FixedSizeBinary(rhs)) => {
+            Ok(lhs.buffer_handle().to_host_sync().as_slice()
+                == rhs.buffer_handle().to_host_sync().as_slice())
+        }
         (Canonical::VarBinView(lhs), Canonical::VarBinView(rhs)) => {
             check_varbinview_identical(lhs, rhs)
         }

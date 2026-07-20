@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBuffer;
+use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -18,6 +20,7 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::ExtensionArray;
+use crate::arrays::FixedSizeBinaryArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::NullArray;
@@ -123,6 +126,24 @@ pub(crate) fn constant_canonicalize(
                 const_value,
                 array.dtype(),
                 array.len(),
+            ))
+        }
+        DType::FixedSizeBinary(byte_width, _) => {
+            let value = scalar
+                .as_binary()
+                .value()
+                .cloned()
+                .unwrap_or_else(|| ByteBuffer::zeroed(*byte_width as usize));
+            let mut values =
+                ByteBufferMut::with_capacity(array.len().saturating_mul(*byte_width as usize));
+            for _ in 0..array.len() {
+                values.extend_from_slice(value.as_slice());
+            }
+            Canonical::FixedSizeBinary(FixedSizeBinaryArray::new(
+                values.freeze(),
+                *byte_width,
+                array.len(),
+                validity,
             ))
         }
         DType::List(..) => Canonical::List(constant_canonical_list_array(scalar, array.len())),

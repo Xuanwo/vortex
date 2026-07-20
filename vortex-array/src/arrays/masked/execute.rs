@@ -22,6 +22,7 @@ use crate::arrays::VarBinViewArray;
 use crate::arrays::VariantArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::extension::ExtensionArrayExt;
+use crate::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
@@ -48,6 +49,18 @@ pub fn mask_validity_canonical(
         Canonical::Bool(a) => Canonical::Bool(mask_validity_bool(a, validity)?),
         Canonical::Primitive(a) => Canonical::Primitive(mask_validity_primitive(a, validity)?),
         Canonical::Decimal(a) => Canonical::Decimal(mask_validity_decimal(a, validity)?),
+        Canonical::FixedSizeBinary(a) => {
+            let byte_width = a.byte_width();
+            let len = a.len();
+            let buffer = a.buffer_handle().clone();
+            let new_validity = Validity::and(a.validity()?, validity)?;
+            Canonical::FixedSizeBinary(crate::arrays::FixedSizeBinaryArray::try_new_handle(
+                buffer,
+                byte_width,
+                len,
+                new_validity,
+            )?)
+        }
         Canonical::VarBinView(a) => Canonical::VarBinView(mask_validity_varbinview(a, validity)?),
         Canonical::List(a) => Canonical::List(mask_validity_listview(a, validity)?),
         Canonical::FixedSizeList(a) => {

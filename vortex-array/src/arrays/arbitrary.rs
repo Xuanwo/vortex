@@ -26,6 +26,7 @@ use crate::arrays::VarBinViewArray;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::DecimalBuilder;
+use crate::builders::FixedSizeBinaryBuilder;
 use crate::builders::FixedSizeListBuilder;
 use crate::builders::ListViewBuilder;
 use crate::dtype::DType;
@@ -154,6 +155,17 @@ fn random_array_chunk(
         }
         DType::Utf8(n) => random_string(u, *n, chunk_len),
         DType::Binary(n) => random_bytes(u, *n, chunk_len),
+        d @ DType::FixedSizeBinary(byte_width, n) => {
+            let elem_len = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(*byte_width, *n, elem_len);
+            for _ in 0..elem_len {
+                let scalar = random_scalar(u, d)?;
+                builder
+                    .append_scalar(&scalar)
+                    .vortex_expect("random fixed-size binary scalar must match its builder");
+            }
+            Ok(builder.finish())
+        }
         DType::List(elem_dtype, null) => random_list(u, elem_dtype, *null, chunk_len),
         DType::FixedSizeList(elem_dtype, list_size, null) => {
             random_fixed_size_list(u, elem_dtype, *list_size, *null, chunk_len)

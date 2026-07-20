@@ -45,6 +45,7 @@ use crate::aggregate_fn::EmptyOptions;
 use crate::array::ArrayView;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use crate::arrays::varbinview::BinaryView;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
@@ -197,6 +198,16 @@ pub(crate) fn canonical_uncompressed_size_in_bytes(
         Canonical::Bool(array) => bool_uncompressed_size_in_bytes(array, ctx),
         Canonical::Primitive(array) => primitive_uncompressed_size_in_bytes(array, ctx),
         Canonical::Decimal(array) => decimal_uncompressed_size_in_bytes(array, ctx),
+        Canonical::FixedSizeBinary(array) => {
+            let byte_width = array.byte_width();
+            let values = checked_len_mul(array.len(), byte_width as usize, "fixed-size binary")?;
+            let validity = validity_uncompressed_size_in_bytes(
+                array.as_ref().validity()?.execute_mask(array.len(), ctx)?,
+            )?;
+            values
+                .checked_add(validity)
+                .ok_or_else(|| vortex_err!("uncompressed size in bytes overflowed u64"))
+        }
         Canonical::VarBinView(array) => varbinview_uncompressed_size_in_bytes(array, ctx),
         Canonical::List(array) => list_view_uncompressed_size_in_bytes(array, ctx),
         Canonical::FixedSizeList(array) => fixed_size_list_uncompressed_size_in_bytes(array, ctx),
@@ -232,6 +243,9 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
             array.len(),
             array.scalar().as_binary().value().map(|value| value.len()),
         )?,
+        DType::FixedSizeBinary(byte_width, _) => {
+            checked_len_mul(array.len(), *byte_width as usize, "fixed-size binary")?
+        }
         DType::List(..) | DType::FixedSizeList(..) | DType::Struct(..) | DType::Extension(_) => {
             let canonical = array.array().clone().execute::<Canonical>(ctx)?;
             return canonical_uncompressed_size_in_bytes(&canonical, ctx);
@@ -289,6 +303,7 @@ fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
         | DType::Bool(_)
         | DType::Primitive(..)
         | DType::Decimal(..)
+        | DType::FixedSizeBinary(..)
         | DType::Utf8(_)
         | DType::Binary(_) => true,
         DType::List(element_dtype, _) | DType::FixedSizeList(element_dtype, ..) => {

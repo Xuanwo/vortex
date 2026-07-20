@@ -4,9 +4,9 @@
 //! Built-in array encodings.
 //!
 //! Canonical arrays are the default uncompressed representation for a logical dtype:
-//! [`NullArray`], [`BoolArray`], [`PrimitiveArray`], [`DecimalArray`], [`VarBinViewArray`],
-//! [`ListViewArray`], [`FixedSizeListArray`], [`StructArray`], [`UnionArray`],
-//! [`ExtensionArray`], and [`VariantArray`].
+//! [`NullArray`], [`BoolArray`], [`PrimitiveArray`], [`DecimalArray`],
+//! [`FixedSizeBinaryArray`], [`VarBinViewArray`], [`ListViewArray`], [`FixedSizeListArray`],
+//! [`StructArray`], [`UnionArray`], [`ExtensionArray`], and [`VariantArray`].
 //!
 //! Utility and lazy arrays represent common transformations without immediately materializing
 //! their result. Examples include [`ChunkedArray`] for concatenation, [`ConstantArray`] for repeated
@@ -61,6 +61,13 @@ pub use filter::Filter;
 pub use filter::FilterArray;
 
 pub(crate) mod fixed_width;
+
+pub mod fixed_size_binary;
+pub use fixed_size_binary::FixedSizeBinary;
+pub use fixed_size_binary::FixedSizeBinaryArray;
+pub use fixed_size_binary::FixedSizeBinaryArrayExt;
+pub use fixed_size_binary::FixedSizeBinaryData;
+pub use fixed_size_binary::FixedSizeBinaryDataParts;
 
 pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
@@ -134,10 +141,11 @@ use vortex_session::VortexSession;
 pub(crate) fn initialize(session: &VortexSession) {
     bool::initialize(session);
     chunked::initialize(session);
-    decimal::initialize(session);
     dict::initialize(session);
+    decimal::initialize(session);
     extension::initialize(session);
     filter::initialize(session);
+    fixed_size_binary::initialize(session);
     fixed_size_list::initialize(session);
     list::initialize(session);
     listview::initialize(session);

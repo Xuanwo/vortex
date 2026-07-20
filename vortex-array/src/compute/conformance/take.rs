@@ -78,6 +78,18 @@ fn test_take_all(array: &ArrayRef, ctx: &mut ExecutionCtx) {
                 result_prim.buffer_handle().to_host_sync()
             );
         }
+        (Canonical::Decimal(orig_prim), Canonical::Decimal(result_prim)) => {
+            assert_eq!(
+                orig_prim.buffer_handle().to_host_sync(),
+                result_prim.buffer_handle().to_host_sync()
+            );
+        }
+        (Canonical::FixedSizeBinary(orig_prim), Canonical::FixedSizeBinary(result_prim)) => {
+            assert_eq!(
+                orig_prim.buffer_handle().to_host_sync(),
+                result_prim.buffer_handle().to_host_sync()
+            );
+        }
         _ => {
             // For non-primitive types, check scalar values
             for i in 0..len {

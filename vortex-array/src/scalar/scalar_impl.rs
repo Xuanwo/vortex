@@ -211,6 +211,7 @@ impl Scalar {
             DType::Decimal(..) => value.as_decimal().is_zero(),
             DType::Utf8(_) => value.as_utf8().is_empty(),
             DType::Binary(_) => value.as_binary().is_empty(),
+            DType::FixedSizeBinary(..) => value.as_binary().iter().all(|byte| *byte == 0),
             DType::List(..) => value.as_list().is_empty(),
             // A fixed-size list is zero only if it has the expected number of elements and every
             // element is itself a non-null zero value.1
@@ -290,7 +291,7 @@ impl Scalar {
             DType::Utf8(_) => self
                 .value()
                 .map_or_else(|| 0, |value| value.as_utf8().len()),
-            DType::Binary(_) => self
+            DType::Binary(_) | DType::FixedSizeBinary(..) => self
                 .value()
                 .map_or_else(|| 0, |value| value.as_binary().len()),
             DType::List(..) | DType::FixedSizeList(..) => self

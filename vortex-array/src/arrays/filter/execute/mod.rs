@@ -89,6 +89,9 @@ pub(super) fn execute_filter(canonical: Canonical, mask: &Arc<MaskValues>) -> Ca
         Canonical::Bool(a) => Canonical::Bool(bool::filter_bool(&a, mask)),
         Canonical::Primitive(a) => Canonical::Primitive(fixed_width::filter::filter(&a, mask)),
         Canonical::Decimal(a) => Canonical::Decimal(fixed_width::filter::filter(&a, mask)),
+        Canonical::FixedSizeBinary(a) => {
+            Canonical::FixedSizeBinary(fixed_width::filter::filter(&a, mask))
+        }
         Canonical::VarBinView(a) => Canonical::VarBinView(varbinview::filter_varbinview(&a, mask)),
         Canonical::List(a) => Canonical::List(listview::filter_listview(&a, mask)),
         Canonical::FixedSizeList(a) => {

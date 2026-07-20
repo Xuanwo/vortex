@@ -52,6 +52,7 @@ mod bool;
 mod decimal;
 pub mod dict;
 mod extension;
+mod fixed_size_binary;
 mod fixed_size_list;
 mod list;
 mod listview;
@@ -63,6 +64,7 @@ mod varbinview;
 pub use bool::*;
 pub use decimal::*;
 pub use extension::*;
+pub use fixed_size_binary::*;
 pub use fixed_size_list::*;
 pub use list::*;
 pub use listview::*;
@@ -339,6 +341,11 @@ pub fn builder_with_capacity(dtype: &DType, capacity: usize) -> Box<dyn ArrayBui
         DType::Utf8(n) => Box::new(VarBinViewBuilder::with_capacity(DType::Utf8(*n), capacity)),
         DType::Binary(n) => Box::new(VarBinViewBuilder::with_capacity(
             DType::Binary(*n),
+            capacity,
+        )),
+        DType::FixedSizeBinary(byte_width, n) => Box::new(FixedSizeBinaryBuilder::with_capacity(
+            *byte_width,
+            *n,
             capacity,
         )),
         DType::List(dtype, n) => Box::new(ListViewBuilder::<u64, u64>::with_capacity(

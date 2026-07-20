@@ -96,6 +96,13 @@ impl Serialize for DType {
             }
             DType::Utf8(n) => serializer.serialize_newtype_variant("DType", 4, "Utf8", n),
             DType::Binary(n) => serializer.serialize_newtype_variant("DType", 5, "Binary", n),
+            DType::FixedSizeBinary(size, n) => {
+                let mut state =
+                    serializer.serialize_tuple_variant("DType", 12, "FixedSizeBinary", 2)?;
+                state.serialize_field(size)?;
+                state.serialize_field(n)?;
+                state.end()
+            }
             DType::List(element_dtype, n) => {
                 let mut state = serializer.serialize_tuple_variant("DType", 6, "List", 2)?;
                 state.serialize_field(element_dtype.as_ref())?;
@@ -175,6 +182,7 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
             "Decimal",
             "Utf8",
             "Binary",
+            "FixedSizeBinary",
             "List",
             "FixedSizeList",
             "Struct",
@@ -227,6 +235,12 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
                     "Binary" => {
                         let n = access.newtype_variant()?;
                         Ok(DType::Binary(n))
+                    }
+                    "FixedSizeBinary" => {
+                        #[derive(Deserialize)]
+                        struct Fields(u32, Nullability);
+                        let Fields(size, n) = access.newtype_variant()?;
+                        Ok(DType::FixedSizeBinary(size, n))
                     }
                     "List" => access.newtype_variant_seed(ListFieldsSeed {
                         session: self.session,

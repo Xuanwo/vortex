@@ -403,7 +403,9 @@ fn string_from_proto(s: &str, dtype: &DType) -> VortexResult<ScalarValue> {
 fn bytes_from_proto(bytes: &[u8], dtype: &DType) -> VortexResult<ScalarValue> {
     match dtype {
         DType::Utf8(_) => Ok(ScalarValue::Utf8(BufferString::try_from(bytes)?)),
-        DType::Binary(_) => Ok(ScalarValue::Binary(ByteBuffer::copy_from(bytes))),
+        DType::Binary(_) | DType::FixedSizeBinary(..) => {
+            Ok(ScalarValue::Binary(ByteBuffer::copy_from(bytes)))
+        }
         // TODO(connor): This is incorrect, we need to verify this matches the inner decimal_dtype.
         DType::Decimal(..) => Ok(ScalarValue::Decimal(match bytes.len() {
             1 => DecimalValue::I8(bytes[0] as i8),
@@ -666,6 +668,18 @@ mod tests {
             ByteBuffer::copy_from(b"hello"),
             Nullability::NonNullable,
         ));
+    }
+
+    #[test]
+    fn test_scalar_value_serde_roundtrip_fixed_size_binary() {
+        round_trip(Scalar::fixed_size_binary(
+            ByteBuffer::copy_from(b"0123456789abcdef"),
+            Nullability::Nullable,
+        ));
+        round_trip(Scalar::null(DType::FixedSizeBinary(
+            16,
+            Nullability::Nullable,
+        )));
     }
 
     #[test]

@@ -411,10 +411,10 @@ impl AggregateFnVTable for MinMax {
                 Ok(())
             }
             Columnar::Canonical(c) => match c {
-                Canonical::Primitive(p) => accumulate_primitive(partial, p, ctx),
+                Canonical::Primitive(a) => accumulate_primitive(partial, a, ctx),
+                Canonical::Decimal(a) => accumulate_decimal(partial, a, ctx),
                 Canonical::Bool(b) => accumulate_bool(partial, b, ctx),
                 Canonical::VarBinView(v) => accumulate_varbinview(partial, v, ctx),
-                Canonical::Decimal(d) => accumulate_decimal(partial, d, ctx),
                 Canonical::Extension(e) => accumulate_extension(partial, e, ctx),
                 Canonical::Null(_) => Ok(()),
                 Canonical::Union(_) => {
@@ -423,6 +423,7 @@ impl AggregateFnVTable for MinMax {
                 Canonical::Struct(_)
                 | Canonical::List(_)
                 | Canonical::FixedSizeList(_)
+                | Canonical::FixedSizeBinary(_)
                 | Canonical::Variant(_) => {
                     vortex_bail!("Unsupported canonical type for min_max: {}", batch.dtype())
                 }

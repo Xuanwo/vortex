@@ -162,6 +162,24 @@ fn build_values_comparator(
             let rhs = rhs.clone().execute::<VarBinViewArray>(ctx)?;
             Box::new(move |i, j| view_bytes(&lhs, i).cmp(view_bytes(&rhs, j)))
         }
+        DType::FixedSizeBinary(byte_width, _) => {
+            let byte_width = *byte_width as usize;
+            let lhs = lhs
+                .clone()
+                .execute::<crate::arrays::FixedSizeBinaryArray>(ctx)?
+                .buffer_handle()
+                .to_host_sync();
+            let rhs = rhs
+                .clone()
+                .execute::<crate::arrays::FixedSizeBinaryArray>(ctx)?
+                .buffer_handle()
+                .to_host_sync();
+            Box::new(move |i, j| {
+                let lhs_start = i * byte_width;
+                let rhs_start = j * byte_width;
+                lhs[lhs_start..lhs_start + byte_width].cmp(&rhs[rhs_start..rhs_start + byte_width])
+            })
+        }
         DType::Struct(..) => {
             let lhs = lhs.clone().execute::<StructArray>(ctx)?;
             let rhs = rhs.clone().execute::<StructArray>(ctx)?;
