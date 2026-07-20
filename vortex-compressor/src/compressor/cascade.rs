@@ -114,11 +114,14 @@ impl CascadingCompressor {
             Canonical::Bool(bool_array) => {
                 self.choose_and_compress(Canonical::Bool(bool_array), compress_ctx, exec_ctx)
             }
-            Canonical::Primitive(primitive) => {
-                self.choose_and_compress(Canonical::Primitive(primitive), compress_ctx, exec_ctx)
+            Canonical::Primitive(array) => {
+                self.choose_and_compress(Canonical::Primitive(array), compress_ctx, exec_ctx)
             }
-            Canonical::Decimal(decimal) => {
-                self.choose_and_compress(Canonical::Decimal(decimal), compress_ctx, exec_ctx)
+            Canonical::Decimal(array) => {
+                self.choose_and_compress(Canonical::Decimal(array), compress_ctx, exec_ctx)
+            }
+            Canonical::FixedSizeBinary(array) => {
+                self.choose_and_compress(Canonical::FixedSizeBinary(array), compress_ctx, exec_ctx)
             }
             Canonical::Struct(struct_array) => {
                 let fields = struct_array

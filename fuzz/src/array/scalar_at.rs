@@ -8,6 +8,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
+use vortex_array::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::listview::ListViewArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -38,19 +39,18 @@ pub fn scalar_at_canonical_array(
             array.to_bit_buffer().value(index),
             array.dtype().nullability(),
         ),
-        Canonical::Primitive(array) => {
-            match_each_native_ptype!(array.ptype(), |T| {
-                Scalar::primitive(array.as_slice::<T>()[index], array.dtype().nullability())
-            })
-        }
-        Canonical::Decimal(array) => {
-            match_each_decimal_value_type!(array.values_type(), |D| {
-                Scalar::decimal(
-                    DecimalValue::from(array.buffer::<D>()[index]),
-                    array.decimal_dtype(),
-                    array.dtype().nullability(),
-                )
-            })
+        Canonical::Primitive(array) => match_each_native_ptype!(array.ptype(), |T| {
+            Scalar::primitive(array.as_slice::<T>()[index], array.dtype().nullability())
+        }),
+        Canonical::Decimal(array) => match_each_decimal_value_type!(array.values_type(), |D| {
+            Scalar::decimal(
+                DecimalValue::from(array.buffer::<D>()[index]),
+                array.decimal_dtype(),
+                array.dtype().nullability(),
+            )
+        }),
+        Canonical::FixedSizeBinary(array) => {
+            Scalar::fixed_size_binary(array.value(index), array.dtype().nullability())
         }
         Canonical::VarBinView(array) => varbin_scalar(array.bytes_at(index), array.dtype()),
         Canonical::List(array) => {

@@ -67,6 +67,12 @@ impl Display for DTypePythonRepr<'_> {
             }
             DType::Utf8(n) => write!(f, "utf8(nullable={})", n.python_repr()),
             DType::Binary(n) => write!(f, "binary(nullable={})", n.python_repr()),
+            DType::FixedSizeBinary(byte_width, n) => write!(
+                f,
+                "fixed_size_binary({}, nullable={})",
+                byte_width,
+                n.python_repr()
+            ),
             DType::List(edt, n) => write!(
                 f,
                 "list({}, nullable={})",

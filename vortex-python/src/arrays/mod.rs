@@ -196,6 +196,8 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<builtins::PyNullArray>()?;
     m.add_class::<builtins::PyBoolArray>()?;
     m.add_class::<builtins::PyPrimitiveArray>()?;
+    m.add_class::<builtins::PyDecimalArray>()?;
+    m.add_class::<builtins::PyFixedSizeBinaryArray>()?;
     m.add_class::<builtins::PyVarBinArray>()?;
     m.add_class::<builtins::PyVarBinViewArray>()?;
     m.add_class::<builtins::PyStructArray>()?;

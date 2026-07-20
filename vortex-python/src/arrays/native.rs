@@ -13,6 +13,7 @@ use vortex::array::arrays::Constant;
 use vortex::array::arrays::Decimal;
 use vortex::array::arrays::Dict;
 use vortex::array::arrays::Extension;
+use vortex::array::arrays::FixedSizeBinary;
 use vortex::array::arrays::FixedSizeList;
 use vortex::array::arrays::List;
 use vortex::array::arrays::Null;
@@ -41,6 +42,7 @@ use crate::arrays::builtins::PyChunkedArray;
 use crate::arrays::builtins::PyConstantArray;
 use crate::arrays::builtins::PyDecimalArray;
 use crate::arrays::builtins::PyExtensionArray;
+use crate::arrays::builtins::PyFixedSizeBinaryArray;
 use crate::arrays::builtins::PyFixedSizeListArray;
 use crate::arrays::builtins::PyListArray;
 use crate::arrays::builtins::PyNullArray;
@@ -89,6 +91,10 @@ impl PyNativeArray {
 
         if array.is::<Primitive>() {
             return Self::with_subclass(py, array, PyPrimitiveArray);
+        }
+
+        if array.is::<FixedSizeBinary>() {
+            return Self::with_subclass(py, array, PyFixedSizeBinaryArray);
         }
 
         if array.is::<VarBin>() {

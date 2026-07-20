@@ -111,6 +111,7 @@ impl PyScalar {
             DType::Decimal(..) => Self::with_subclass(py, scalar, PyDecimalScalar),
             DType::Utf8(..) => Self::with_subclass(py, scalar, PyUtf8Scalar),
             DType::Binary(..) => Self::with_subclass(py, scalar, PyBinaryScalar),
+            DType::FixedSizeBinary(..) => Self::with_subclass(py, scalar, PyBinaryScalar),
             DType::List(..) | DType::FixedSizeList(..) => {
                 // We represent both lists and fixed-size lists with `PyListScalar` since the notion
                 // of "fixed-size" only applies to full arrays, not scalars.

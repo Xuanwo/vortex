@@ -84,6 +84,7 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(factory::dtype_float, &m)?)?;
     m.add_function(wrap_pyfunction!(factory::dtype_utf8, &m)?)?;
     m.add_function(wrap_pyfunction!(factory::dtype_binary, &m)?)?;
+    m.add_function(wrap_pyfunction!(factory::dtype_fixed_size_binary, &m)?)?;
     m.add_function(wrap_pyfunction!(factory::dtype_struct, &m)?)?;
     m.add_function(wrap_pyfunction!(factory::dtype_list, &m)?)?;
     m.add_function(wrap_pyfunction!(factory::dtype_fixed_size_list, &m)?)?;
@@ -132,6 +133,7 @@ impl PyDType {
             DType::Decimal(..) => Self::with_subclass(py, dtype, PyDecimalDType),
             DType::Utf8(..) => Self::with_subclass(py, dtype, PyUtf8DType),
             DType::Binary(..) => Self::with_subclass(py, dtype, PyBinaryDType),
+            DType::FixedSizeBinary(..) => Self::with_subclass(py, dtype, PyBinaryDType),
             DType::List(..) => Self::with_subclass(py, dtype, PyListDType),
             DType::FixedSizeList(..) => Self::with_subclass(py, dtype, PyFixedSizeListDType),
             DType::Struct(..) => Self::with_subclass(py, dtype, PyStructDType),

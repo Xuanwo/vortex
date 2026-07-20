@@ -73,7 +73,7 @@ impl<'py> IntoPyObject<'py> for PyVortex<&'_ Scalar> {
                 .cloned()
                 .map(PyVortex)
                 .into_pyobject(py),
-            DType::Binary(_) => self
+            DType::Binary(_) | DType::FixedSizeBinary(..) => self
                 .0
                 .as_binary()
                 .value()

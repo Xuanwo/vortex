@@ -486,7 +486,7 @@ fn actions_for_dtype(dtype: &DType) -> HashSet<ActionType> {
             // These support all actions
             ActionType::iter().collect()
         }
-        DType::Utf8(_) | DType::Binary(_) => {
+        DType::Utf8(_) | DType::Binary(_) | DType::FixedSizeBinary(..) => {
             // Utf8/Binary supports everything except Sum and FillNull
             // Actions: Compress, Slice, Take, SearchSorted, Filter, Compare, Cast, MinMax, Mask, ScalarAt
             [

@@ -11,6 +11,7 @@ mod byte;
 pub mod byte_view;
 mod decimal;
 mod dictionary;
+mod fixed_size_binary;
 mod fixed_size_list;
 mod list;
 mod list_view;
@@ -48,6 +49,7 @@ use crate::executor::byte::to_arrow_byte_array;
 use crate::executor::byte_view::to_arrow_byte_view;
 use crate::executor::decimal::to_arrow_decimal;
 use crate::executor::dictionary::to_arrow_dictionary;
+use crate::executor::fixed_size_binary::to_arrow_fixed_size_binary;
 use crate::executor::fixed_size_list::to_arrow_fixed_list;
 use crate::executor::list::to_arrow_list;
 use crate::executor::list_view::to_arrow_list_view;
@@ -162,6 +164,7 @@ pub(crate) fn execute_arrow_naive(
         DataType::FixedSizeList(elements_field, list_size) => {
             to_arrow_fixed_list(array, *list_size, elements_field, ctx)
         }
+        DataType::FixedSizeBinary(_) => to_arrow_fixed_size_binary(array, ctx),
         // TODO(joe): pass down preferred
         DataType::ListView(elements_field) => to_arrow_list_view::<i32>(array, elements_field, ctx),
         // TODO(joe): pass down preferred
@@ -191,11 +194,7 @@ pub(crate) fn execute_arrow_naive(
         dt @ (DataType::Date32 | DataType::Date64) => to_arrow_date(array, dt, ctx),
         dt @ (DataType::Time32(_) | DataType::Time64(_)) => to_arrow_time(array, dt, ctx),
         dt @ DataType::Timestamp(..) => to_arrow_timestamp(array, dt, ctx),
-        DataType::FixedSizeBinary(_)
-        | DataType::Map(..)
-        | DataType::Duration(_)
-        | DataType::Interval(_)
-        | DataType::Union(..) => {
+        DataType::Map(..) | DataType::Duration(_) | DataType::Interval(_) | DataType::Union(..) => {
             vortex_bail!("Conversion to Arrow type {resolved_type} is not supported");
         }
     }?;

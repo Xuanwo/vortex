@@ -45,11 +45,15 @@ impl CudaExecute for SliceExecutor {
                 .into_array()
                 .slice(range)?
                 .execute::<Canonical>(ctx.execution_ctx()),
-            Canonical::Primitive(prim_array) => prim_array
+            Canonical::Primitive(array) => array
                 .into_array()
                 .slice(range)?
                 .execute::<Canonical>(ctx.execution_ctx()),
-            Canonical::Decimal(decimal_array) => decimal_array
+            Canonical::Decimal(array) => array
+                .into_array()
+                .slice(range)?
+                .execute::<Canonical>(ctx.execution_ctx()),
+            Canonical::FixedSizeBinary(array) => array
                 .into_array()
                 .slice(range)?
                 .execute::<Canonical>(ctx.execution_ctx()),

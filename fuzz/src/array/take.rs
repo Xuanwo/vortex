@@ -114,7 +114,7 @@ pub fn take_canonical_array(
             )
             .into_array())
         }
-        DType::List(..) | DType::FixedSizeList(..) => {
+        DType::FixedSizeBinary(..) | DType::List(..) | DType::FixedSizeList(..) => {
             let mut builder = builder_with_capacity(
                 &array.dtype().union_nullability(nullable),
                 indices_slice_non_opt.len(),

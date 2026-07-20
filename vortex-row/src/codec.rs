@@ -194,6 +194,9 @@ pub(crate) fn row_width_for_dtype(dtype: &DType) -> VortexResult<RowWidth> {
                 vt.byte_width(),
             ))))
         }
+        DType::FixedSizeBinary(..) => {
+            vortex_bail!("row encoding does not support FixedSizeBinary arrays")
+        }
         DType::Utf8(_) | DType::Binary(_) => Ok(RowWidth::Variable),
         DType::FixedSizeList(elem, n, _) => match row_width_for_dtype(elem)? {
             // FSL is fixed iff its element type is fixed. Add a sentinel byte for the FSL

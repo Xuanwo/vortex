@@ -260,6 +260,15 @@ fn export_canonical(
 
                 export_fixed_size(buffer, len, 0, validity_buffer, null_count, ctx)
             }
+            Canonical::FixedSizeBinary(array) => {
+                let len = array.len();
+                let validity = array.validity()?;
+                let buffer = array.buffer_handle().clone();
+                let (validity_buffer, null_count) =
+                    export_arrow_validity_buffer(validity, len, 0, ctx).await?;
+                let buffer = ctx.ensure_on_device(buffer).await?;
+                export_fixed_size(buffer, len, 0, validity_buffer, null_count, ctx)
+            }
             Canonical::Null(null_array) => {
                 let len = null_array.len();
 

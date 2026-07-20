@@ -97,7 +97,7 @@ pub fn filter_canonical_array(
                 .collect::<Vec<_>>();
             Ok(VarBinViewArray::from_iter(values, array.dtype().clone()).into_array())
         }
-        DType::List(..) | DType::FixedSizeList(..) => {
+        DType::FixedSizeBinary(..) | DType::List(..) | DType::FixedSizeList(..) => {
             let mut indices = Vec::new();
             for (idx, bool) in filter.iter().enumerate() {
                 if *bool {

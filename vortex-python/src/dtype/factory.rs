@@ -322,6 +322,17 @@ pub(super) fn dtype_binary(py: Python<'_>, nullable: bool) -> PyResult<Bound<'_,
     PyDType::init(py, DType::Binary(nullable.into()))
 }
 
+/// Construct a fixed-size binary data type.
+#[pyfunction(name = "fixed_size_binary")]
+#[pyo3(signature = (byte_width, *, nullable = false))]
+pub(super) fn dtype_fixed_size_binary(
+    py: Python<'_>,
+    byte_width: u32,
+    nullable: bool,
+) -> PyResult<Bound<'_, PyDType>> {
+    PyDType::init(py, DType::FixedSizeBinary(byte_width, nullable.into()))
+}
+
 /// Construct a struct data type.
 ///
 /// Parameters

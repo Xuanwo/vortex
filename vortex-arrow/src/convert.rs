@@ -8,6 +8,7 @@ use arrow_array::Array as ArrowArray;
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::BooleanArray as ArrowBooleanArray;
 use arrow_array::DictionaryArray;
+use arrow_array::FixedSizeBinaryArray as ArrowFixedSizeBinaryArray;
 use arrow_array::FixedSizeListArray as ArrowFixedSizeListArray;
 use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
@@ -62,6 +63,7 @@ use vortex_array::IntoArray;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::DictArray;
+use vortex_array::arrays::FixedSizeBinaryArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::ListViewArray;
@@ -220,6 +222,16 @@ impl FromArrowArray<&ArrowPrimitiveArray<Decimal256Type>> for ArrayRef {
             unsafe { std::mem::transmute::<Buffer<arrow_buffer::i256>, Buffer<i256>>(buffer) };
         let validity = nulls(array.nulls(), nullable)?;
         Ok(DecimalArray::new(buffer, decimal_type, validity).into_array())
+    }
+}
+
+impl FromArrowArray<&ArrowFixedSizeBinaryArray> for ArrayRef {
+    fn from_arrow(value: &ArrowFixedSizeBinaryArray, nullable: bool) -> VortexResult<Self> {
+        let byte_width = u32::try_from(value.value_length())
+            .map_err(|_| vortex_err!("Arrow fixed-size binary width cannot be negative"))?;
+        let values = ByteBuffer::from_arrow_buffer(value.values().clone(), Alignment::of::<u8>());
+        let validity = nulls(value.nulls(), nullable)?;
+        Ok(FixedSizeBinaryArray::new(values, byte_width, value.len(), validity).into_array())
     }
 }
 
@@ -546,6 +558,9 @@ impl FromArrowArray<&dyn ArrowArray> for ArrayRef {
             DataType::ListView(_) => Self::from_arrow(array.as_list_view::<i32>(), nullable),
             DataType::LargeListView(_) => Self::from_arrow(array.as_list_view::<i64>(), nullable),
             DataType::FixedSizeList(..) => Self::from_arrow(array.as_fixed_size_list(), nullable),
+            DataType::FixedSizeBinary(..) => {
+                Self::from_arrow(array.as_fixed_size_binary(), nullable)
+            }
             DataType::Null => Self::from_arrow(as_null_array(array), nullable),
             DataType::Timestamp(u, _) => match u {
                 ArrowTimeUnit::Second => {

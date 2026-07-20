@@ -9,6 +9,8 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::FixedSizeBinary;
+use vortex_array::arrays::FixedSizeBinaryArray;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::ListView;
@@ -20,6 +22,7 @@ use vortex_array::arrays::Struct;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::listview::ListViewArrayExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
@@ -56,6 +59,7 @@ use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferString;
 use vortex_buffer::ByteBuffer;
+use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_buffer::buffer_mut;
 use vortex_error::VortexError;
@@ -142,6 +146,14 @@ pub(super) fn execute_sparse(parts: SparseParts, ctx: &mut ExecutionCtx) -> Vort
             let fill = fill_value.as_binary().value().cloned();
             execute_varbin(&patches, &fill_value, dtype.clone(), fill, len, ctx)?
         }
+        DType::FixedSizeBinary(byte_width, nullability) => execute_sparse_fixed_size_binary(
+            &patches,
+            &fill_value,
+            *byte_width,
+            *nullability,
+            len,
+            ctx,
+        )?,
         DType::List(values_dtype, nullability) => execute_sparse_lists(
             &patches,
             &fill_value,
@@ -165,6 +177,43 @@ pub(super) fn execute_sparse(parts: SparseParts, ctx: &mut ExecutionCtx) -> Vort
         DType::Variant(_) => vortex_bail!("Sparse canonicalization does not support Variant"),
         DType::Extension(_ext_dtype) => todo!(),
     })
+}
+
+fn execute_sparse_fixed_size_binary(
+    resolved: &Patches,
+    fill_scalar: &Scalar,
+    byte_width: u32,
+    nullability: Nullability,
+    len: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let byte_width_usize = byte_width as usize;
+    let fill = fill_scalar
+        .as_binary()
+        .value()
+        .cloned()
+        .unwrap_or_else(|| ByteBuffer::zeroed(byte_width_usize));
+    let mut dense = ByteBufferMut::with_capacity(len.saturating_mul(byte_width_usize));
+    for _ in 0..len {
+        dense.extend_from_slice(fill.as_slice());
+    }
+
+    let indices = resolved.indices().as_::<Primitive>().into_owned();
+    let values = resolved.values().as_::<FixedSizeBinary>().into_owned();
+    let patch_bytes = values.buffer_handle().to_host_sync();
+    match_each_integer_ptype!(indices.ptype(), |I| {
+        for (patch_row, patch_index) in indices.as_slice::<I>().iter().enumerate() {
+            let patch_index = <usize as NumCast>::from(*patch_index)
+                .vortex_expect("fixed-size binary patch index must fit in usize");
+            let source = patch_row * byte_width_usize;
+            let target = patch_index * byte_width_usize;
+            dense[target..target + byte_width_usize]
+                .copy_from_slice(&patch_bytes[source..source + byte_width_usize]);
+        }
+    });
+
+    let validity = sparse_validity(resolved, fill_scalar, nullability, len, ctx)?;
+    Ok(FixedSizeBinaryArray::new(dense.freeze(), byte_width, len, validity).into_array())
 }
 
 fn execute_sparse_lists(

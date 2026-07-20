@@ -21,6 +21,7 @@ use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::Dict;
+use vortex_array::arrays::FixedSizeBinaryArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
@@ -164,6 +165,14 @@ async fn test_round_trip_many_types() {
 
     let numbers = buffer![1u32, 2, 3].into_array();
 
+    let fixed_binary = FixedSizeBinaryArray::new(
+        buffer![1u8, 2, 3, 4, 5, 6].into_byte_buffer(),
+        2,
+        3,
+        Validity::from_iter([true, false, true]),
+    )
+    .into_array();
+
     let decimal_2 = DecimalArray::new(
         buffer![100i8, 10i8, 2i8],
         DecimalDType::new(2, 1),
@@ -202,6 +211,7 @@ async fn test_round_trip_many_types() {
     let st = StructArray::from_fields(&[
         ("strings", strings),
         ("numbers", numbers),
+        ("fixed_binary", fixed_binary),
         ("decimal_2", decimal_2),
         ("decimal_4", decimal_4),
         ("decimal_9", decimal_9),

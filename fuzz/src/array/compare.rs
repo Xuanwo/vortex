@@ -174,7 +174,10 @@ pub fn compare_canonical_array(
                 result_nullability,
             )
         }
-        DType::List(..) | DType::FixedSizeList(..) | DType::Struct(..) => {
+        DType::FixedSizeBinary(..)
+        | DType::List(..)
+        | DType::FixedSizeList(..)
+        | DType::Struct(..) => {
             let scalar_vals: Vec<Scalar> = (0..array.len())
                 .map(|i| array.execute_scalar(i, ctx).vortex_expect("scalar_at"))
                 .collect();

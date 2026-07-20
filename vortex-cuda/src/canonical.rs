@@ -11,12 +11,14 @@ use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::DecimalArray;
 use vortex::array::arrays::ExtensionArray;
+use vortex::array::arrays::FixedSizeBinaryArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::bool::BoolDataParts;
 use vortex::array::arrays::decimal::DecimalDataParts;
 use vortex::array::arrays::extension::ExtensionArrayExt;
+use vortex::array::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::arrays::struct_::StructDataParts;
 use vortex::array::arrays::varbinview::BinaryView;
@@ -114,6 +116,15 @@ impl CanonicalCudaExt for Canonical {
                         validity,
                     )
                 }))
+            }
+            Canonical::FixedSizeBinary(array) => {
+                let byte_width = array.byte_width();
+                let len = array.len();
+                let validity = array.validity()?;
+                let values = array.buffer_handle().clone().try_into_host()?.await?;
+                Ok(Canonical::FixedSizeBinary(FixedSizeBinaryArray::new(
+                    values, byte_width, len, validity,
+                )))
             }
             Canonical::VarBinView(varbinview) => {
                 let VarBinViewDataParts {

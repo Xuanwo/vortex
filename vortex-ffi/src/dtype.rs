@@ -59,6 +59,8 @@ pub enum vx_dtype_variant {
     DTYPE_DECIMAL = 8,
     /// Nested fixed-size list type.
     DTYPE_FIXED_SIZE_LIST = 9,
+    /// Fixed-size binary data.
+    DTYPE_FIXED_SIZE_BINARY = 10,
 }
 
 // TODO(connor)[Union]
@@ -71,6 +73,7 @@ impl From<&DType> for vx_dtype_variant {
             DType::Decimal(..) => vx_dtype_variant::DTYPE_DECIMAL,
             DType::Utf8(_) => vx_dtype_variant::DTYPE_UTF8,
             DType::Binary(_) => vx_dtype_variant::DTYPE_BINARY,
+            DType::FixedSizeBinary(..) => vx_dtype_variant::DTYPE_FIXED_SIZE_BINARY,
             DType::List(..) => vx_dtype_variant::DTYPE_LIST,
             DType::FixedSizeList(..) => vx_dtype_variant::DTYPE_FIXED_SIZE_LIST,
             DType::Struct(..) => vx_dtype_variant::DTYPE_STRUCT,
@@ -118,6 +121,15 @@ pub unsafe extern "C-unwind" fn vx_dtype_new_utf8(is_nullable: bool) -> *const v
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_dtype_new_binary(is_nullable: bool) -> *const vx_dtype {
     vx_dtype::new(DType::Binary(is_nullable.into()))
+}
+
+/// Create a new fixed-size binary data type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_new_fixed_size_binary(
+    byte_width: u32,
+    is_nullable: bool,
+) -> *const vx_dtype {
+    vx_dtype::new(DType::FixedSizeBinary(byte_width, is_nullable.into()))
 }
 
 /// Create a new list data type.
@@ -253,6 +265,15 @@ pub unsafe extern "C-unwind" fn vx_dtype_fixed_size_list_size(dtype: *const vx_d
     match dtype_ref {
         DType::FixedSizeList(_, size, _) => *size,
         _ => vortex_panic!("not a fixed-size list dtype"),
+    }
+}
+
+/// Returns the byte width of a fixed-size binary type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_fixed_size_binary_size(dtype: *const vx_dtype) -> u32 {
+    match vx_dtype::as_ref(dtype) {
+        DType::FixedSizeBinary(size, _) => *size,
+        _ => vortex_panic!("not a fixed-size binary dtype"),
     }
 }
 
@@ -557,6 +578,20 @@ mod tests {
     }
 
     #[test]
+    fn test_dtype_fixed_size_binary() {
+        unsafe {
+            let dtype = vx_dtype_new_fixed_size_binary(16, true);
+            assert_eq!(
+                vx_dtype_get_variant(dtype),
+                vx_dtype_variant::DTYPE_FIXED_SIZE_BINARY
+            );
+            assert!(vx_dtype_is_nullable(dtype));
+            assert_eq!(vx_dtype_fixed_size_binary_size(dtype), 16);
+            vx_dtype_free(dtype);
+        }
+    }
+
+    #[test]
     fn test_dtype_primitive_ptype() {
         unsafe {
             let u8_dtype = vx_dtype_new_primitive(vx_ptype::PTYPE_U8, false);
@@ -581,6 +616,7 @@ mod tests {
             DType::Decimal(DecimalDType::new(10, 2), true.into()),
             DType::Utf8(false.into()),
             DType::Binary(true.into()),
+            DType::FixedSizeBinary(16, true.into()),
             DType::FixedSizeList(
                 Arc::new(DType::Primitive(vortex::dtype::PType::U8, false.into())),
                 4,
@@ -597,6 +633,9 @@ mod tests {
                 DType::Decimal(..) => assert_eq!(variant, vx_dtype_variant::DTYPE_DECIMAL),
                 DType::Utf8(_) => assert_eq!(variant, vx_dtype_variant::DTYPE_UTF8),
                 DType::Binary(_) => assert_eq!(variant, vx_dtype_variant::DTYPE_BINARY),
+                DType::FixedSizeBinary(..) => {
+                    assert_eq!(variant, vx_dtype_variant::DTYPE_FIXED_SIZE_BINARY)
+                }
                 DType::FixedSizeList(..) => {
                     assert_eq!(variant, vx_dtype_variant::DTYPE_FIXED_SIZE_LIST)
                 }

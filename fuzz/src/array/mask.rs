@@ -17,6 +17,7 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
+use vortex_array::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
@@ -91,6 +92,16 @@ pub fn mask_canonical_array(
                 DecimalArray::new(array.buffer::<D>(), array.decimal_dtype(), new_validity)
                     .into_array()
             })
+        }
+        Canonical::FixedSizeBinary(array) => {
+            let new_validity = mask_validity(&array.validity()?, mask, ctx);
+            vortex_array::arrays::FixedSizeBinaryArray::new(
+                array.buffer_handle().to_host_sync(),
+                array.byte_width(),
+                array.len(),
+                new_validity,
+            )
+            .into_array()
         }
         Canonical::VarBinView(array) => {
             let new_validity = mask_validity(&array.validity()?, mask, ctx);

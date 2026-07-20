@@ -42,6 +42,7 @@ pub fn fill_null_canonical_array(
             fill_primitive_array(array, fill_value, result_nullability, ctx)
         }
         Canonical::Decimal(array) => fill_decimal_array(array, fill_value, result_nullability, ctx),
+        Canonical::FixedSizeBinary(array) => array.into_array().fill_null(fill_value.clone())?,
         Canonical::VarBinView(array) => {
             fill_varbinview_array(array, fill_value, result_nullability, ctx)
         }

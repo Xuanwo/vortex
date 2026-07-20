@@ -28,6 +28,9 @@ pub(crate) fn new_exporter(
         Canonical::Bool(array) => bool::new_exporter(array, ctx),
         Canonical::Primitive(array) => primitive::new_exporter(array, ctx),
         Canonical::Decimal(array) => decimal::new_exporter(array, ctx),
+        Canonical::FixedSizeBinary(_) => {
+            vortex_bail!("DuckDB export does not support fixed-size binary arrays")
+        }
         Canonical::VarBinView(array) => varbinview::new_exporter(array, ctx),
         Canonical::List(array) => list_view::new_exporter(array, cache, ctx),
         Canonical::FixedSizeList(array) => fixed_size_list::new_exporter(array, cache, ctx),

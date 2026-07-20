@@ -119,6 +119,15 @@ impl TryToDataFusion<ScalarValue> for Scalar {
                     .cloned()
                     .map(|b| Vec::<u8>::from(b.into_inner())),
             ),
+            DType::FixedSizeBinary(byte_width, _) => ScalarValue::FixedSizeBinary(
+                i32::try_from(*byte_width).map_err(|_| {
+                    vortex_err!("Fixed-size binary width exceeds DataFusion i32 range")
+                })?,
+                self.as_binary()
+                    .value()
+                    .cloned()
+                    .map(|b| Vec::<u8>::from(b.into_inner())),
+            ),
             dtype @ DType::List(..) => vortex_bail!(
                 "cannot convert Vortex scalar dtype {dtype} to DataFusion ScalarValue: unsupported scalar type"
             ),
@@ -224,13 +233,22 @@ impl FromDataFusion<ScalarValue> for Scalar {
                 .as_ref()
                 .map(|s| Scalar::from(s.as_str()))
                 .unwrap_or_else(|| Scalar::null(DType::Utf8(Nullability::Nullable))),
-            ScalarValue::Binary(b)
-            | ScalarValue::BinaryView(b)
-            | ScalarValue::LargeBinary(b)
-            | ScalarValue::FixedSizeBinary(_, b) => b
+            ScalarValue::Binary(b) | ScalarValue::BinaryView(b) | ScalarValue::LargeBinary(b) => b
                 .as_ref()
                 .map(|b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable))
                 .unwrap_or_else(|| Scalar::null(DType::Binary(Nullability::Nullable))),
+            ScalarValue::FixedSizeBinary(byte_width, b) => b
+                .as_ref()
+                .map(|b| {
+                    Scalar::fixed_size_binary(ByteBuffer::from(b.clone()), Nullability::Nullable)
+                })
+                .unwrap_or_else(|| {
+                    Scalar::null(DType::FixedSizeBinary(
+                        u32::try_from(*byte_width)
+                            .vortex_expect("DataFusion fixed-size binary width is non-negative"),
+                        Nullability::Nullable,
+                    ))
+                }),
             ScalarValue::Date32(v)
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {

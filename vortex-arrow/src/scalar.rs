@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use arrow_array::Scalar as ArrowScalar;
 use arrow_array::*;
+use arrow_buffer::Buffer;
+use arrow_buffer::NullBuffer;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_array::extension::datetime::AnyTemporal;
@@ -68,6 +70,26 @@ impl ToArrowDatum for Scalar {
             DType::Decimal(..) => decimal_to_arrow(value.as_decimal()),
             DType::Utf8(_) => utf8_to_arrow(value.as_utf8()),
             DType::Binary(_) => binary_to_arrow(value.as_binary()),
+            DType::FixedSizeBinary(byte_width, _) => {
+                let byte_width = i32::try_from(*byte_width)
+                    .map_err(|_| vortex_err!("Fixed-size binary width exceeds Arrow i32 range"))?;
+                match value.as_binary().value() {
+                    Some(bytes) => {
+                        let nulls =
+                            (byte_width == 0).then(|| NullBuffer::new_valid(SCALAR_ARRAY_LEN));
+                        Ok(Arc::new(ArrowScalar::new(FixedSizeBinaryArray::new(
+                            byte_width,
+                            Buffer::from(bytes.to_vec()),
+                            nulls,
+                        ))))
+                    }
+                    None => Ok(Arc::new(ArrowScalar::new(FixedSizeBinaryArray::new(
+                        byte_width,
+                        Buffer::from(vec![0; byte_width as usize]),
+                        Some(NullBuffer::new_null(SCALAR_ARRAY_LEN)),
+                    )))),
+                }
+            }
             DType::List(..) => unimplemented!("list scalar conversion"),
             DType::FixedSizeList(..) => unimplemented!("fixed-size list scalar conversion"),
             DType::Struct(..) => unimplemented!("struct scalar conversion"),
@@ -351,6 +373,17 @@ mod tests {
         let scalar = Scalar::binary(data, Nullability::NonNullable);
         let result = scalar.to_arrow_datum();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_zero_width_fixed_size_binary_scalar_to_arrow() {
+        let scalar = Scalar::fixed_size_binary(Vec::<u8>::new(), Nullability::NonNullable);
+        let datum = scalar.to_arrow_datum().unwrap();
+        let (array, is_scalar) = datum.get();
+
+        assert!(is_scalar);
+        assert_eq!(array.len(), 1);
+        assert_eq!(array.null_count(), 0);
     }
 
     #[test]

@@ -69,15 +69,18 @@ impl CudaExecute for FilterExecutor {
             m @ Mask::Values(_) => {
                 let canonical = child.execute_cuda(ctx).await?;
                 match canonical {
-                    Canonical::Primitive(prim) => {
-                        match_each_native_simd_ptype!(prim.ptype(), |T| {
-                            filter_primitive::<T>(prim, m, ctx).await
+                    Canonical::Primitive(array) => {
+                        match_each_native_simd_ptype!(array.ptype(), |T| {
+                            filter_primitive::<T>(array, m, ctx).await
                         })
                     }
-                    Canonical::Decimal(decimal) => {
-                        match_each_decimal_value_type!(decimal.values_type(), |D| {
-                            filter_decimal::<D>(decimal, m, ctx).await
+                    Canonical::Decimal(array) => {
+                        match_each_decimal_value_type!(array.values_type(), |D| {
+                            filter_decimal::<D>(array, m, ctx).await
                         })
+                    }
+                    Canonical::FixedSizeBinary(array) => {
+                        unimplemented!("CUDA filter for {}", array.dtype())
                     }
                     Canonical::VarBinView(varbinview) => {
                         filter_varbinview(varbinview, m, ctx).await
