@@ -115,8 +115,7 @@ fn take_chunked(
     let chunk_offsets = array.chunk_offset_values();
     let nchunks = array.nchunks();
     let mut flattener = ChunkFlattener::new(array.dtype(), pairs.len());
-    let mut final_take = BufferMut::<u64>::with_capacity(n);
-    final_take.push_n(0u64, n);
+    let mut final_take = BufferMut::<u64>::zeroed(n);
 
     let mut cursor = 0usize;
     let mut dedup_idx = 0u64;
@@ -154,13 +153,7 @@ fn take_chunked(
 
     // 4. Single take to restore original order and expand duplicates.
     //    Carry the original index validity so null indices produce null outputs.
-    let take_validity = Validity::from_mask(
-        indices
-            .as_ref()
-            .validity()?
-            .execute_mask(indices.as_ref().len(), ctx)?,
-        indices.dtype().nullability(),
-    );
+    let take_validity = Validity::from_mask(indices_mask, indices.dtype().nullability());
     flat.take(PrimitiveArray::new(final_take.freeze(), take_validity).into_array())
 }
 
