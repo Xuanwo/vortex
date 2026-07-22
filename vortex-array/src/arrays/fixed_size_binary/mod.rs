@@ -698,7 +698,11 @@ mod tests {
 
     #[rstest]
     #[case(0)]
+    #[case(1)]
+    #[case(2)]
     #[case(3)]
+    #[case(4)]
+    #[case(8)]
     #[case(16)]
     #[case(32)]
     fn filter_and_take_runtime_widths(#[case] byte_width: u32) -> VortexResult<()> {
