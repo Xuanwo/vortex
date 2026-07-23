@@ -24,7 +24,7 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow_array::Array as _;
+use arrow_array::Array as ArrowArray;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::make_array;
@@ -61,8 +61,8 @@ use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_session::registry::Id;
 
-use crate::FromArrowArray;
 use crate::IntoVortexArray;
+use crate::convert::from_arrow_dyn;
 use crate::convert::nulls;
 use crate::convert::remove_nulls;
 use crate::dtype::from_arrow_data_type;
@@ -154,12 +154,17 @@ pub trait ArrowImportVTable: 'static + Send + Sync + Debug {
     ///
     /// Returns ownership of `array` via [`ArrowImport::Unsupported`] when the plugin cannot
     /// handle the input.
+    ///
+    /// `session` is provided so plugins can convert storage or nested arrays through the
+    /// session (e.g. [`ArrowSession::from_arrow_array_nullable`]) instead of the deprecated
+    /// `FromArrowArray` trait.
     #[allow(clippy::wrong_self_convention)]
     fn from_arrow_array(
         &self,
         array: ArrowArrayRef,
         field: &Field,
         dtype: &DType,
+        session: &ArrowSession,
     ) -> VortexResult<ArrowImport>;
 }
 
@@ -527,23 +532,42 @@ impl ArrowSession {
                 let dtype = self.from_arrow_field(field)?;
                 let mut current = array;
                 for plugin in importers.iter() {
-                    match plugin.from_arrow_array(current, field, &dtype)? {
+                    match plugin.from_arrow_array(current, field, &dtype, self)? {
                         ArrowImport::Imported(arr) => return Ok(arr),
                         ArrowImport::Unsupported(arr) => current = arr,
                     }
                 }
-                return ArrayRef::from_arrow(current.as_ref(), field.is_nullable());
+                return self.from_arrow_array_canonical(current.as_ref(), field);
             }
         }
-        self.from_arrow_array_canonical(array, field)
+        self.from_arrow_array_canonical(array.as_ref(), field)
+    }
+
+    /// Decode an Arrow array into a Vortex array whose dtype has the requested `nullable`ness.
+    ///
+    /// An Arrow array can carry a validity (null) buffer regardless of whether its schema
+    /// declares the field nullable, so the desired nullability is supplied by the caller.
+    /// Returns an error if `nullable` is `false` but the array physically contains nulls.
+    ///
+    /// No top-level Arrow [`Field`] is available in this form, so no extension plugin is
+    /// dispatched for the array itself; fields nested inside container data types still carry
+    /// their metadata and are routed through [`Self::from_arrow_array`]. Prefer the
+    /// field-aware [`Self::from_arrow_array`] when a [`Field`] is in hand.
+    pub fn from_arrow_array_nullable(
+        &self,
+        array: &dyn ArrowArray,
+        nullable: bool,
+    ) -> VortexResult<ArrayRef> {
+        let field = Field::new("", array.data_type().clone(), nullable);
+        self.from_arrow_array_canonical(array, &field)
     }
 
     /// Recurse into Arrow container arrays so nested fields with extension metadata reach
-    /// their importers, falling through to [`ArrayRef::from_arrow`] for leaf types.
+    /// their importers, falling through to the canonical conversion for leaf types.
     #[allow(clippy::wrong_self_convention)]
     fn from_arrow_array_canonical(
         &self,
-        array: ArrowArrayRef,
+        array: &dyn ArrowArray,
         field: &Field,
     ) -> VortexResult<ArrayRef> {
         use arrow_array::cast::AsArray;
@@ -619,7 +643,7 @@ impl ArrowSession {
                 let validity = nulls(list.nulls(), field.is_nullable())?;
                 Ok(ListViewArray::try_new(elements, offsets, sizes, validity)?.into_array())
             }
-            _ => ArrayRef::from_arrow(array.as_ref(), field.is_nullable()),
+            _ => from_arrow_dyn(array, field.is_nullable()),
         }
     }
 }

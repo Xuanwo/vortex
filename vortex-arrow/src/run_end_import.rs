@@ -3,7 +3,6 @@
 
 use arrow_array::RunArray;
 use arrow_array::types::RunEndIndexType;
-use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
@@ -17,8 +16,11 @@ use vortex_runend::RunEndData;
 use vortex_runend::ops::find_physical_index;
 use vortex_runend::ops::find_slice_end_index;
 
+#[allow(deprecated)]
 use crate::FromArrowArray;
+use crate::convert::from_arrow_dyn;
 
+#[allow(deprecated)]
 impl<R: RunEndIndexType> FromArrowArray<&RunArray<R>> for RunEndData
 where
     R::Native: NativePType,
@@ -31,7 +33,7 @@ where
             Buffer::<R::Native>::from_arrow_scalar_buffer(array.run_ends().inner().clone());
         let ends = PrimitiveArray::new(ends_buf, Validity::NonNullable)
             .reinterpret_cast(R::Native::PTYPE.to_unsigned());
-        let values = ArrayRef::from_arrow(array.values().as_ref(), nullable)?;
+        let values = from_arrow_dyn(array.values().as_ref(), nullable)?;
 
         let ends_array = PrimitiveArray::from_buffer_handle(
             ends.buffer_handle().clone(),
@@ -96,7 +98,7 @@ mod tests {
     use vortex_session::VortexSession;
 
     use crate::ArrowSessionExt;
-    use crate::FromArrowArray;
+    use crate::convert::from_arrow_dyn;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         let session = vortex_array::array_session();
@@ -117,7 +119,7 @@ mod tests {
             Buffer::<R::Native>::from_arrow_scalar_buffer(array.run_ends().inner().clone());
         let ends = PrimitiveArray::new(ends_buf, Validity::NonNullable)
             .reinterpret_cast(R::Native::PTYPE.to_unsigned());
-        let values = ArrayRef::from_arrow(array.values().as_ref(), nullable)?;
+        let values = from_arrow_dyn(array.values().as_ref(), nullable)?;
 
         let ends_array = PrimitiveArray::from_buffer_handle(
             ends.buffer_handle().clone(),

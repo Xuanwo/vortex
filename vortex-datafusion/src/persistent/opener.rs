@@ -610,7 +610,6 @@ mod tests {
     use object_store::memory::InMemory;
     use rstest::rstest;
     use vortex::VortexSessionDefault;
-    use vortex::array::ArrayRef;
     use vortex::buffer::Buffer;
     use vortex::file::WriteOptionsSessionExt;
     use vortex::io::VortexWrite;
@@ -618,7 +617,6 @@ mod tests {
     use vortex::metrics::DefaultMetricsRegistry;
     use vortex::scan::selection::Selection;
     use vortex::session::VortexSession;
-    use vortex_arrow::FromArrowArray;
 
     use super::*;
     use crate::VortexAccessPlan;
@@ -736,7 +734,8 @@ mod tests {
         path: &str,
         rb: RecordBatch,
     ) -> anyhow::Result<u64> {
-        let array = ArrayRef::from_arrow(rb, false)?;
+        let schema = rb.schema();
+        let array = SESSION.arrow().from_arrow_record_batch(rb, &schema)?;
         let path = Path::parse(path)?;
 
         let mut write = ObjectStoreWrite::new(object_store, &path).await?;

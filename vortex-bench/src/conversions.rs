@@ -53,7 +53,6 @@ use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_set::HashSet;
 use vortex_arrow::ArrowSessionExt;
-use vortex_arrow::FromArrowArray;
 use vortex_geo::extension::GeoMetadata;
 use vortex_geo::extension::WellKnownBinary;
 use wkb::Endianness;
@@ -119,7 +118,8 @@ pub fn parquet_to_vortex_stream(
 ) -> impl futures::Stream<Item = VortexResult<ArrayRef>> {
     reader.map(move |result| {
         result.map_err(|e| vortex_err!(External: e)).and_then(|rb| {
-            let chunk = ArrayRef::from_arrow(rb, false)?;
+            let schema = rb.schema();
+            let chunk = SESSION.arrow().from_arrow_record_batch(rb, &schema)?;
             let mut builder = builder_with_capacity(chunk.dtype(), chunk.len());
 
             // Canonicalize the chunk.
