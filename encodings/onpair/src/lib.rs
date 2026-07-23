@@ -22,8 +22,11 @@ mod tests;
 
 pub use array::*;
 pub use compress::*;
+pub use onpair::CompactDictionaryView;
 pub use onpair::Config;
+pub use onpair::DictionaryView;
 pub use onpair::Error as OnPairError;
+pub use onpair::MAX_TOKEN_SIZE;
 pub use onpair::MaxDictBits;
 pub use onpair::Threshold;
 use vortex_array::session::ArraySessionExt;

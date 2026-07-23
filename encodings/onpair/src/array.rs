@@ -213,7 +213,10 @@ impl OnPairData {
 /// validates the dictionary content; both results are memoized in
 /// [`OnPairData`], so subsequent calls — including on arrays derived by
 /// slice / filter / cast, which share the cell — pay neither cost again.
-pub(crate) fn dict_view<'a>(
+///
+/// Public so out-of-crate decoders (e.g. the CUDA executor in `vortex-cuda`)
+/// can materialise decode-time dictionary layouts from the validated view.
+pub fn dict_view<'a>(
     array: ArrayView<'a, OnPair>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<CompactDictionaryView<'a>> {

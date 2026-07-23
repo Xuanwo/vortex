@@ -9710,6 +9710,7 @@ dependencies = [
  "vortex-error",
  "vortex-fsst",
  "vortex-nvcomp",
+ "vortex-onpair",
 ]
 
 [[package]]
