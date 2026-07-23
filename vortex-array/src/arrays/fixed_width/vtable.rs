@@ -49,6 +49,31 @@ pub(crate) fn deserialize_validity(
         child_count => vortex_bail!("Expected 0 or 1 child, got {child_count}"),
     }
 }
+
+pub(crate) fn validate_layout(
+    array_name: &str,
+    data_len: usize,
+    nullability: Nullability,
+    len: usize,
+    slots: &[Option<ArrayRef>],
+) -> VortexResult<()> {
+    vortex_ensure!(slots.len() == 1, "{array_name} expects one validity slot");
+    vortex_ensure!(
+        data_len == len,
+        InvalidArgument:
+        "{array_name} length {data_len} does not match outer length {len}"
+    );
+    let validity = child_to_validity(slots[0].as_ref(), nullability);
+    if let Some(validity_len) = validity.maybe_len() {
+        vortex_ensure!(
+            validity_len == len,
+            InvalidArgument:
+            "{array_name} validity len {validity_len} does not match outer length {len}"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validity<V: VTable>(array: ArrayView<'_, V>) -> VortexResult<Validity> {
     Ok(child_to_validity(
         array.slots()[0].as_ref(),
