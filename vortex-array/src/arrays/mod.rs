@@ -60,6 +60,8 @@ pub mod filter;
 pub use filter::Filter;
 pub use filter::FilterArray;
 
+pub(crate) mod fixed_width;
+
 pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
 pub use fixed_size_list::FixedSizeListArray;
