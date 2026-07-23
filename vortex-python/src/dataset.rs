@@ -25,7 +25,7 @@ use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::layout::scan::split_by::SplitBy;
-use vortex_arrow::ToArrowType;
+use vortex_arrow::ArrowSessionExt;
 
 use crate::RUNTIME;
 use crate::arrays::PyArrayRef;
@@ -112,7 +112,7 @@ pub struct PyVortexDataset {
 
 impl PyVortexDataset {
     pub fn try_new(vxf: VortexFile) -> VortexResult<Self> {
-        let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+        let schema = Arc::new(session().arrow().to_arrow_schema(vxf.dtype())?);
         Ok(Self { vxf, schema })
     }
 
@@ -194,7 +194,7 @@ impl PyVortexDataset {
                 scan = scan.with_row_range(l..r);
             }
 
-            let schema = Arc::new(scan.dtype()?.to_arrow_schema()?);
+            let schema = Arc::new(session().arrow().to_arrow_schema(&scan.dtype()?)?);
             let reader: Box<dyn RecordBatchReader + Send> =
                 Box::new(scan.into_record_batch_reader(schema, &*RUNTIME)?);
             VortexResult::Ok(reader)

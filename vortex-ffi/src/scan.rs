@@ -32,7 +32,6 @@ use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
 use vortex_arrow::ArrowSessionExt;
-use vortex_arrow::ToArrowType;
 
 use crate::RUNTIME;
 use crate::array::vx_array;
@@ -366,11 +365,11 @@ pub unsafe extern "C-unwind" fn vx_partition_scan_arrow(
         let array_stream = partition.execute()?;
         let dtype = array_stream.dtype();
 
-        let schema = dtype.to_arrow_schema()?;
+        let session = vx_session::as_ref(session);
+
+        let schema = session.arrow().to_arrow_schema(dtype)?;
         let schema = Arc::new(schema);
         let target = Field::new_struct("", schema.fields().clone(), false);
-
-        let session = vx_session::as_ref(session);
 
         let on_chunk = move |chunk: VortexResult<ArrayRef>| -> VortexResult<RecordBatch> {
             let chunk: ArrayRef = chunk?;
