@@ -4,9 +4,9 @@
 mod between;
 mod cast;
 mod fill_null;
+mod fixed_width;
 mod mask;
 pub mod rules;
-mod take;
 
 #[cfg(test)]
 mod tests {

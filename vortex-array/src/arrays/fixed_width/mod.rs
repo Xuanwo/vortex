@@ -3,4 +3,9 @@
 
 //! Shared structural operations for fixed-width canonical arrays.
 
+mod array;
+pub(crate) mod filter;
+pub(crate) mod take;
 pub(crate) mod vtable;
+
+pub(crate) use self::array::FixedWidthArray;
