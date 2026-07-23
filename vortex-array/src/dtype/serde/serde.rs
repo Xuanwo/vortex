@@ -34,6 +34,42 @@ use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ForeignExtDType;
 use crate::dtype::session::DTypeSessionExt;
 
+// Keep this in the same order as the explicit discriminants in `DType::serialize`. Compact Serde
+// formats deserialize enum discriminants by indexing this table.
+const DTYPE_VARIANTS: &[&str] = &[
+    "Null",
+    "Bool",
+    "Primitive",
+    "Decimal",
+    "Utf8",
+    "Binary",
+    "List",
+    "FixedSizeList",
+    "Struct",
+    "Extension",
+    "Variant",
+    "Union",
+    "FixedSizeBinary",
+];
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(field_identifier)]
+enum DTypeVariant {
+    Null,
+    Bool,
+    Primitive,
+    Decimal,
+    Utf8,
+    Binary,
+    List,
+    FixedSizeList,
+    Struct,
+    Extension,
+    Variant,
+    Union,
+    FixedSizeBinary,
+}
+
 /// Serialize Nullability as a boolean
 impl Serialize for Nullability {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -175,22 +211,6 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
     where
         D: Deserializer<'de>,
     {
-        const VARIANTS: &[&str] = &[
-            "Null",
-            "Bool",
-            "Primitive",
-            "Decimal",
-            "Utf8",
-            "Binary",
-            "FixedSizeBinary",
-            "List",
-            "FixedSizeList",
-            "Struct",
-            "Union",
-            "Variant",
-            "Extension",
-        ];
-
         struct DTypeVisitor<'a> {
             session: &'a VortexSession,
         }
@@ -206,71 +226,72 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
             where
                 A: EnumAccess<'de>,
             {
-                let (variant, access) = data.variant::<Cow<'_, str>>()?;
-                match variant.as_ref() {
-                    "Null" => {
+                let (variant, access) = data.variant::<DTypeVariant>()?;
+                match variant {
+                    DTypeVariant::Null => {
                         access.unit_variant()?;
                         Ok(DType::Null)
                     }
-                    "Bool" => {
+                    DTypeVariant::Bool => {
                         let n = access.newtype_variant()?;
                         Ok(DType::Bool(n))
                     }
-                    "Primitive" => {
+                    DTypeVariant::Primitive => {
                         #[derive(Deserialize)]
                         struct Fields(PType, Nullability);
                         let Fields(ptype, n) = access.newtype_variant()?;
                         Ok(DType::Primitive(ptype, n))
                     }
-                    "Decimal" => {
+                    DTypeVariant::Decimal => {
                         #[derive(Deserialize)]
                         struct Fields(DecimalDType, Nullability);
                         let Fields(decimal, n) = access.newtype_variant()?;
                         Ok(DType::Decimal(decimal, n))
                     }
-                    "Utf8" => {
+                    DTypeVariant::Utf8 => {
                         let n = access.newtype_variant()?;
                         Ok(DType::Utf8(n))
                     }
-                    "Binary" => {
+                    DTypeVariant::Binary => {
                         let n = access.newtype_variant()?;
                         Ok(DType::Binary(n))
                     }
-                    "FixedSizeBinary" => {
+                    DTypeVariant::FixedSizeBinary => {
                         #[derive(Deserialize)]
                         struct Fields(u32, Nullability);
                         let Fields(size, n) = access.newtype_variant()?;
                         Ok(DType::FixedSizeBinary(size, n))
                     }
-                    "List" => access.newtype_variant_seed(ListFieldsSeed {
+                    DTypeVariant::List => access.newtype_variant_seed(ListFieldsSeed {
                         session: self.session,
                     }),
-                    "FixedSizeList" => access.newtype_variant_seed(FixedSizeListFieldsSeed {
+                    DTypeVariant::FixedSizeList => {
+                        access.newtype_variant_seed(FixedSizeListFieldsSeed {
+                            session: self.session,
+                        })
+                    }
+                    DTypeVariant::Struct => access.newtype_variant_seed(StructFieldsSeed {
                         session: self.session,
                     }),
-                    "Struct" => access.newtype_variant_seed(StructFieldsSeed {
+                    DTypeVariant::Union => access.newtype_variant_seed(UnionFieldsSeed {
                         session: self.session,
                     }),
-                    "Union" => access.newtype_variant_seed(UnionFieldsSeed {
-                        session: self.session,
-                    }),
-                    "Variant" => {
+                    DTypeVariant::Variant => {
                         let n = access.newtype_variant()?;
                         Ok(DType::Variant(n))
                     }
-                    "Extension" => {
+                    DTypeVariant::Extension => {
                         let ext = access
                             .newtype_variant_seed(DTypeSerde::<ExtDTypeRef>::new(self.session))?;
                         Ok(DType::Extension(ext))
                     }
-                    _ => Err(de::Error::unknown_variant(&variant, VARIANTS)),
                 }
             }
         }
 
         deserializer.deserialize_enum(
             "DType",
-            VARIANTS,
+            DTYPE_VARIANTS,
             DTypeVisitor {
                 session: self.session,
             },
@@ -766,5 +787,29 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, ExtDTypeRef> {
                 session: self.session,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::de::value::Error;
+    use serde::de::value::U64Deserializer;
+
+    use super::DTypeVariant;
+
+    #[test]
+    fn compact_dtype_discriminants_preserve_existing_variants() -> Result<(), Error> {
+        for (index, expected) in [
+            (6, DTypeVariant::List),
+            (9, DTypeVariant::Extension),
+            (11, DTypeVariant::Union),
+            (12, DTypeVariant::FixedSizeBinary),
+        ] {
+            let actual = <DTypeVariant as serde::Deserialize>::deserialize(
+                U64Deserializer::<Error>::new(index),
+            )?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 }

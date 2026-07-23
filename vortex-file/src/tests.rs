@@ -219,6 +219,7 @@ async fn test_round_trip_many_types() {
         ("decimal_35", decimal_35),
     ])
     .unwrap();
+    let expected = st.clone().into_array();
     let dtype = st.dtype().clone();
     let mut buf = ByteBufferMut::empty();
 
@@ -243,6 +244,7 @@ async fn test_round_trip_many_types() {
     let read = ChunkedArray::try_new(chunks, dtype).unwrap();
 
     assert_eq!(read.len(), 3);
+    assert_arrays_eq!(read, expected, &mut SESSION.create_execution_ctx());
 }
 
 #[tokio::test]

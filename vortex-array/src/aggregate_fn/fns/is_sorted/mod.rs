@@ -4,6 +4,7 @@
 mod bool;
 mod decimal;
 mod extension;
+mod fixed_size_binary;
 mod primitive;
 mod varbin;
 
@@ -13,12 +14,12 @@ use std::fmt::Formatter;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
 use vortex_session::registry::CachedId;
 
 use self::bool::check_bool_sorted;
 use self::decimal::check_decimal_sorted;
 use self::extension::check_extension_sorted;
+use self::fixed_size_binary::check_fixed_size_binary_sorted;
 use self::primitive::check_primitive_sorted;
 use self::varbin::check_varbinview_sorted;
 use crate::ArrayRef;
@@ -41,44 +42,6 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
-
-fn check_fixed_size_binary_sorted(
-    array: &crate::arrays::FixedSizeBinaryArray,
-    strict: bool,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<bool> {
-    let DType::FixedSizeBinary(byte_width, _) = array.dtype() else {
-        unreachable!()
-    };
-    let byte_width = *byte_width as usize;
-    let values = array.buffer_handle().to_host_sync();
-    let validity = array.as_ref().validity()?.execute_mask(array.len(), ctx)?;
-    let mut valid = match &validity {
-        Mask::AllTrue(len) => {
-            Box::new(std::iter::repeat_n(true, *len)) as Box<dyn Iterator<Item = bool>>
-        }
-        Mask::AllFalse(len) => Box::new(std::iter::repeat_n(false, *len)),
-        Mask::Values(values) => Box::new(values.bit_buffer().iter()),
-    };
-    let mut previous: Option<Option<&[u8]>> = None;
-    for index in 0..array.len() {
-        let current = valid.next().unwrap_or(false).then(|| {
-            let start = index * byte_width;
-            &values[start..start + byte_width]
-        });
-        if let Some(previous) = previous
-            && if strict {
-                previous >= current
-            } else {
-                previous > current
-            }
-        {
-            return Ok(false);
-        }
-        previous = Some(current);
-    }
-    Ok(true)
-}
 
 /// Options for the `is_sorted` aggregate function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

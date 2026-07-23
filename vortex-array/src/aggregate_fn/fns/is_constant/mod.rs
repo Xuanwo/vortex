@@ -4,13 +4,13 @@
 mod bool;
 mod decimal;
 mod extension;
+mod fixed_size_binary;
 mod fixed_size_list;
 mod list;
 pub mod primitive;
 mod struct_;
 mod varbin;
 
-use itertools::Itertools;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -19,6 +19,7 @@ use vortex_session::registry::CachedId;
 use self::bool::check_bool_constant;
 use self::decimal::check_decimal_constant;
 use self::extension::check_extension_constant;
+use self::fixed_size_binary::check_fixed_size_binary_constant;
 use self::fixed_size_list::check_fixed_size_list_constant;
 use self::list::check_listview_constant;
 use self::primitive::check_primitive_constant;
@@ -36,7 +37,6 @@ use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::EmptyOptions;
 use crate::arrays::Constant;
 use crate::arrays::Null;
-use crate::arrays::fixed_size_binary::FixedSizeBinaryArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::FieldNames;
@@ -399,15 +399,7 @@ impl AggregateFnVTable for IsConstant {
                 let batch_is_constant = match c {
                     Canonical::Primitive(a) => check_primitive_constant(a),
                     Canonical::Decimal(a) => check_decimal_constant(a),
-                    Canonical::FixedSizeBinary(a) => {
-                        let byte_width = a.byte_width() as usize;
-                        let values = a.buffer_handle().to_host_sync();
-                        values
-                            .as_slice()
-                            .chunks_exact(byte_width.max(1))
-                            .map(|value| if byte_width == 0 { &[][..] } else { value })
-                            .all_equal()
-                    }
+                    Canonical::FixedSizeBinary(a) => check_fixed_size_binary_constant(a),
                     Canonical::Bool(b) => check_bool_constant(b),
                     Canonical::VarBinView(v) => check_varbinview_constant(v),
                     Canonical::Struct(s) => check_struct_constant(s, ctx)?,
