@@ -13,7 +13,6 @@ mod wkb;
 
 use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::LazyLock;
 
 use ::wkb::reader::GeometryType;
 use arrow_array::BinaryArray;
@@ -207,13 +206,12 @@ pub(crate) fn single_geometry(
         .ok_or_else(|| vortex_err!("geo: constant operand decoded to no geometry"))
 }
 
-/// Plan-time geometry literal decoding has no session in scope, so its storage arrays
-/// (which carry no Arrow extension metadata) convert through a default [`ArrowSession`].
-static ARROW_SESSION: LazyLock<ArrowSession> = LazyLock::new(ArrowSession::default);
-
 /// Decode a WKB geometry literal (DuckDB's wire form for `GEOMETRY` constants) to its native
 /// `Point`/`Polygon`/`MultiPolygon` scalar. `None` for unsupported types. Plan-time, one value only.
-pub fn native_geometry_scalar_from_wkb(bytes: &[u8]) -> VortexResult<Option<Scalar>> {
+pub fn native_geometry_scalar_from_wkb(
+    bytes: &[u8],
+    session: &ArrowSession,
+) -> VortexResult<Option<Scalar>> {
     let metadata = geoarrow_metadata(&GeoMetadata::default());
     let binary = BinaryArray::from(vec![Some(bytes)]);
     let wkb = GenericWkbArray::<i32>::try_from((
@@ -226,7 +224,7 @@ pub fn native_geometry_scalar_from_wkb(bytes: &[u8]) -> VortexResult<Option<Scal
     let to_storage = |target: &GeoArrowType| -> VortexResult<ArrayRef> {
         let native =
             cast(&wkb, target).map_err(|e| vortex_err!("failed to cast WKB literal: {e}"))?;
-        ARROW_SESSION.from_arrow_array_nullable(native.to_array_ref().as_ref(), false)
+        session.from_arrow_array_nullable(native.to_array_ref().as_ref(), false)
     };
 
     let scalar = match Wkb::try_from_bytes(bytes)?.geometry_type() {
@@ -349,6 +347,7 @@ pub(crate) fn geo_metadata_from_arrow(metadata: &Metadata) -> GeoMetadata {
 mod tests {
     use prost::Message;
     use vortex_array::dtype::DType;
+    use vortex_arrow::ArrowSessionExt;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
@@ -357,8 +356,15 @@ mod tests {
     use super::MultiPoint;
     use super::Point;
     use super::Polygon;
-    use super::native_geometry_scalar_from_wkb;
     use crate::extension::GeoMetadata;
+
+    /// Test shim: decode with an explicitly constructed session.
+    fn native_geometry_scalar_from_wkb(
+        bytes: &[u8],
+    ) -> VortexResult<Option<vortex_array::scalar::Scalar>> {
+        let session = vortex_array::array_session();
+        super::native_geometry_scalar_from_wkb(bytes, &session.arrow())
+    }
 
     #[test]
     fn test_metadata() {

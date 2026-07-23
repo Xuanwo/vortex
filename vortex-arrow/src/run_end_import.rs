@@ -20,44 +20,54 @@ use vortex_runend::ops::find_slice_end_index;
 use crate::FromArrowArray;
 use crate::convert::from_arrow_dyn;
 
+/// Canonical conversion of an Arrow run-end encoded array into Vortex [`RunEndData`].
+#[allow(clippy::disallowed_methods)]
+pub fn from_arrow_run_array<R: RunEndIndexType>(
+    array: &RunArray<R>,
+    nullable: bool,
+) -> VortexResult<RunEndData>
+where
+    R::Native: NativePType,
+{
+    let offset = array.run_ends().offset();
+    let len = array.run_ends().len();
+    let ends_buf = Buffer::<R::Native>::from_arrow_scalar_buffer(array.run_ends().inner().clone());
+    let ends = PrimitiveArray::new(ends_buf, Validity::NonNullable)
+        .reinterpret_cast(R::Native::PTYPE.to_unsigned());
+    let values = from_arrow_dyn(array.values().as_ref(), nullable)?;
+
+    let ends_array = PrimitiveArray::from_buffer_handle(
+        ends.buffer_handle().clone(),
+        ends.ptype(),
+        ends.validity()?,
+    )
+    .into_array();
+    let mut ctx = legacy_session().create_execution_ctx();
+
+    let (ends_slice, values_slice) = if offset == 0 && len == array.run_ends().max_value() {
+        (ends_array, values)
+    } else {
+        let slice_begin = find_physical_index(&ends_array, offset, &mut ctx)?;
+        let slice_end = find_slice_end_index(&ends_array, offset + len, &mut ctx)?;
+
+        (
+            ends_array.slice(slice_begin..slice_end)?,
+            values.slice(slice_begin..slice_end)?,
+        )
+    };
+
+    // SAFETY: arrow-rs enforces the RunEndArray invariants, we inherit their guarantees.
+    RunEndData::validate_parts(&ends_slice, &values_slice, offset, len, &mut ctx)?;
+    Ok(unsafe { RunEndData::new_unchecked(offset) })
+}
+
 #[allow(deprecated)]
 impl<R: RunEndIndexType> FromArrowArray<&RunArray<R>> for RunEndData
 where
     R::Native: NativePType,
 {
-    #[allow(clippy::disallowed_methods)]
     fn from_arrow(array: &RunArray<R>, nullable: bool) -> VortexResult<Self> {
-        let offset = array.run_ends().offset();
-        let len = array.run_ends().len();
-        let ends_buf =
-            Buffer::<R::Native>::from_arrow_scalar_buffer(array.run_ends().inner().clone());
-        let ends = PrimitiveArray::new(ends_buf, Validity::NonNullable)
-            .reinterpret_cast(R::Native::PTYPE.to_unsigned());
-        let values = from_arrow_dyn(array.values().as_ref(), nullable)?;
-
-        let ends_array = PrimitiveArray::from_buffer_handle(
-            ends.buffer_handle().clone(),
-            ends.ptype(),
-            ends.validity()?,
-        )
-        .into_array();
-        let mut ctx = legacy_session().create_execution_ctx();
-
-        let (ends_slice, values_slice) = if offset == 0 && len == array.run_ends().max_value() {
-            (ends_array, values)
-        } else {
-            let slice_begin = find_physical_index(&ends_array, offset, &mut ctx)?;
-            let slice_end = find_slice_end_index(&ends_array, offset + len, &mut ctx)?;
-
-            (
-                ends_array.slice(slice_begin..slice_end)?,
-                values.slice(slice_begin..slice_end)?,
-            )
-        };
-
-        // SAFETY: arrow-rs enforces the RunEndArray invariants, we inherit their guarantees.
-        RunEndData::validate_parts(&ends_slice, &values_slice, offset, len, &mut ctx)?;
-        Ok(unsafe { RunEndData::new_unchecked(offset) })
+        from_arrow_run_array(array, nullable)
     }
 }
 
