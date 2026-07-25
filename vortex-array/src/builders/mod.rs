@@ -65,6 +65,7 @@ mod listview;
 mod null;
 mod primitive;
 mod struct_;
+mod validity;
 mod varbinview;
 
 pub use bool::*;
@@ -77,6 +78,7 @@ pub use listview::*;
 pub use null::*;
 pub use primitive::*;
 pub use struct_::*;
+pub(crate) use validity::ValidityBuilder;
 pub use varbinview::*;
 
 pub use crate::arrays::varbin::builder::DynVarBinBuilder;
