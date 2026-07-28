@@ -3,8 +3,6 @@
 
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 
 use crate::array::ArrayView;
 use crate::arrays::Primitive;
@@ -24,16 +22,9 @@ impl FixedWidthArray for Primitive {
     fn with_values(
         array: ArrayView<'_, Self>,
         values: ByteBuffer,
-        len: usize,
+        _len: usize,
         validity: Validity,
     ) -> VortexResult<PrimitiveArray> {
-        let expected_len = len
-            .checked_mul(array.ptype().byte_width())
-            .ok_or_else(|| vortex_err!("Primitive values buffer length overflows usize"))?;
-        vortex_ensure!(
-            values.len() == expected_len,
-            "Primitive values buffer length does not match output length"
-        );
         Ok(PrimitiveArray::from_byte_buffer(
             values,
             array.ptype(),

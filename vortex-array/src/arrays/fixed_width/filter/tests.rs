@@ -2,8 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use rstest::rstest;
+use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
+use vortex_mask::Mask;
 
+use super::filter_records;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
@@ -17,9 +20,30 @@ use crate::dtype::DecimalDType;
 use crate::dtype::i256;
 use crate::validity::Validity;
 
+#[test]
+fn filter_fallback_width_records() {
+    let Mask::Values(mask) = Mask::from_iter([true, false, true, false]) else {
+        panic!("a mixed mask must have mask values");
+    };
+    let expected = [0u8, 1, 2, 6, 7, 8];
+
+    // A uniquely owned buffer takes the in-place `copy_within` path.
+    let owned = Buffer::from_iter(0u8..12);
+    let filtered = filter_records(owned, 3, &mask);
+    assert_eq!(filtered.as_slice(), &expected);
+
+    // Retaining a second reference forces the copying path instead.
+    let shared = Buffer::from_iter(0u8..12);
+    let _retained = shared.clone();
+    let filtered = filter_records(shared, 3, &mask);
+    assert_eq!(filtered.as_slice(), &expected);
+}
+
 #[rstest]
 #[case::primitive_i8(PrimitiveArray::from_iter([-2i8, -1, 0, 1, 2]).into_array())]
+#[case::primitive_u16(PrimitiveArray::from_iter([1u16, 2, 3, 4, 5]).into_array())]
 #[case::primitive_i32(PrimitiveArray::from_iter([1i32, 2, 3, 4, 5]).into_array())]
+#[case::primitive_f32(PrimitiveArray::from_iter([0.1f32, 0.2, 0.3, 0.4, 0.5]).into_array())]
 #[case::primitive_nullable(PrimitiveArray::from_option_iter(
     [Some(1i64), None, Some(3), Some(4), None],
 ).into_array())]

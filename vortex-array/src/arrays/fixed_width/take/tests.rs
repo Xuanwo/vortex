@@ -45,6 +45,8 @@ fn take_eight_byte_values() {
 #[case(8)]
 #[case(16)]
 #[case(32)]
+#[case::fallback(3)]
+#[case::fallback_wide(12)]
 fn take_runtime_width_records(#[case] byte_width: usize) -> VortexResult<()> {
     let values = Buffer::from_iter((0u8..).take(3 * byte_width));
     let expected = values[2 * byte_width..3 * byte_width]
@@ -55,6 +57,13 @@ fn take_runtime_width_records(#[case] byte_width: usize) -> VortexResult<()> {
     let taken = take_byte_records(&values.into_byte_buffer(), byte_width, 3, &[2u32, 0])?;
     assert_eq!(taken.as_slice(), expected);
     Ok(())
+}
+
+#[test]
+#[should_panic(expected = "take index 3 out of bounds for length 3")]
+fn fallback_take_rejects_out_of_bounds_index() {
+    let values = Buffer::from_iter((0u8..).take(9)).into_byte_buffer();
+    drop(take_byte_records(&values, 3, 3, &[3u32]));
 }
 
 #[test]

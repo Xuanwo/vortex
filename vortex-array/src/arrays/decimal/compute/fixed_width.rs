@@ -3,8 +3,6 @@
 
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 
 use crate::array::ArrayView;
 use crate::arrays::Decimal;
@@ -25,16 +23,9 @@ impl FixedWidthArray for Decimal {
     fn with_values(
         array: ArrayView<'_, Self>,
         values: ByteBuffer,
-        len: usize,
+        _len: usize,
         validity: Validity,
     ) -> VortexResult<DecimalArray> {
-        let expected_len = len
-            .checked_mul(array.values_type().byte_width())
-            .ok_or_else(|| vortex_err!("Decimal values buffer length overflows usize"))?;
-        vortex_ensure!(
-            values.len() == expected_len,
-            "Decimal values buffer length does not match output length"
-        );
         DecimalArray::try_new_handle(
             BufferHandle::new_host(values),
             array.values_type(),

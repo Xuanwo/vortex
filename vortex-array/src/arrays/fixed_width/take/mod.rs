@@ -22,6 +22,7 @@ use self::scalar::take_values_scalar;
 use self::slices::take_slices;
 use self::slices::take_slices_constant_length;
 use super::FixedWidthArray;
+use super::with_values;
 use crate::ArrayRef;
 use crate::Columnar;
 use crate::ExecutionCtx;
@@ -144,7 +145,7 @@ pub(crate) fn take<V: FixedWidthArray>(
         )
     })?;
     Ok(Some(
-        V::with_values(array, values, indices.len(), validity)?.into_array(),
+        with_values(array, values, indices.len(), validity)?.into_array(),
     ))
 }
 
@@ -193,6 +194,6 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
     }?;
     let validity = array.validity()?.take(indices_ref)?;
     Ok(Some(
-        V::with_values(array, taken, output_len, validity)?.into_array(),
+        with_values(array, taken, output_len, validity)?.into_array(),
     ))
 }

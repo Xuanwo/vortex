@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![cfg_attr(miri, ignore)]
-#![cfg(target_arch = "x86_64")]
+#![cfg(all(target_arch = "x86_64", not(miri)))]
 
 use std::panic::RefUnwindSafe;
 use std::panic::catch_unwind;
