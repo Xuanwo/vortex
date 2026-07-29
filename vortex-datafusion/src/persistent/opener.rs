@@ -436,6 +436,7 @@ impl FileOpener for VortexOpener {
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
             let file_location = file.object_meta.location.clone();
+            let split_session = session.clone();
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -446,16 +447,23 @@ impl FileOpener for VortexOpener {
                 // Convert each natural chunk separately: chunk children are independently
                 // decodable, so this skips the chunk-of-struct swizzle and per-column concat
                 // that whole-split conversion pays, without re-decoding shared encoding state
-                // the way slicing the still-lazy array would.
-                .map_ok(move |chunk| {
-                    let chunks: Vec<ArrayRef> = if let Some(chunked) = chunk.as_opt::<Chunked>() {
-                        chunked.non_empty_chunks().cloned().collect()
-                    } else if chunk.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![chunk]
-                    };
-                    stream::iter(chunks.into_iter().map(Ok::<_, VortexError>))
+                // the way slicing the still-lazy array would. Lazy wrappers are executed away
+                // first, since e.g. Filter/Mask/Slice over Chunked distribute per child while
+                // hiding the chunked structure from a literal downcast.
+                .map(move |chunk| {
+                    chunk.and_then(|chunk| {
+                        let mut ctx = split_session.create_execution_ctx();
+                        let chunk = chunk.execute_until::<Chunked>(&mut ctx)?;
+                        let chunks: Vec<ArrayRef> = if let Some(chunked) = chunk.as_opt::<Chunked>()
+                        {
+                            chunked.non_empty_chunks().cloned().collect()
+                        } else if chunk.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![chunk]
+                        };
+                        Ok(stream::iter(chunks.into_iter().map(Ok::<_, VortexError>)))
+                    })
                 })
                 .try_flatten()
                 // Convert to Arrow inline on the polling thread: DataFusion sources are expected
