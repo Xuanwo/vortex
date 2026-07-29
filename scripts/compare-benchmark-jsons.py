@@ -11,10 +11,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+import argparse
 import math
 import os
 import re
-import sys
 from dataclasses import dataclass
 from io import StringIO
 from typing import Any
@@ -106,7 +106,7 @@ def normalize_format_name(value: Any) -> str | None:
     return FORMAT_DISPLAY_NAMES.get(value, value)
 
 
-def comparison_target(name: Any, target: Any = None) -> tuple[str, str, int | None]:
+def comparison_target(name: Any, target: Any = None) -> tuple[str, str, int | str | None]:
     """Return the engine, display format, and optional SQL query number."""
 
     target_engine = None
@@ -119,6 +119,20 @@ def comparison_target(name: Any, target: Any = None) -> tuple[str, str, int | No
     name_engine = match.group(2) if match is not None else None
     name_format = match.group(3) if match is not None else None
     query = int(match.group(1)) if match is not None else None
+
+    if match is None and isinstance(name, str):
+        random_access = re.match(
+            r"^(?P<prefix>random-access(?:/.*)?)/"
+            r"(?P<file_format>parquet|vortex|lance)-(?P<variant>.+)$",
+            name,
+        )
+        if random_access is not None:
+            file_format = random_access.group("file_format")
+            if file_format == "vortex":
+                file_format = "vortex-file-compressed"
+            return "random-access", file_format, (
+                f"{random_access.group('prefix')}/{random_access.group('variant')}"
+            )
 
     engine = str(target_engine or name_engine or "unknown")
     file_format = str(target_format or normalize_format_name(name_format) or "unknown")
@@ -170,25 +184,48 @@ def benchmark_identity_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_jsonl_rows_for_commit(path: str, commit_id: str) -> pd.DataFrame:
-    """Read only rows matching a commit from a JSONL benchmark history."""
+    """Read the latest copy of each row matching a history commit.
 
-    rows = []
+    Re-running a develop workflow appends a second result block for the same
+    commit. Keeping the last copy of each logical row prevents a many-to-one
+    merge from weighting that baseline multiple times.
+    """
+
+    rows_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
     with open(path, encoding="utf-8") as lines:
         for line in lines:
             if '"commit_id"' not in line or f'"{commit_id}"' not in line:
                 continue
             record = orjson.loads(line)
-            if record.get("commit_id") == commit_id:
-                rows.append(record)
-    return pd.DataFrame(rows)
+            if record.get("commit_id") != commit_id:
+                continue
+
+            file_size = record.get("file_size")
+            if isinstance(file_size, dict):
+                identity = (
+                    FILE_SIZE_METRIC,
+                    file_size.get("benchmark"),
+                    file_size.get("scale_factor"),
+                    file_size.get("format"),
+                    file_size.get("file"),
+                )
+            else:
+                identity = ("timing", benchmark_identity(record))
+            rows_by_identity[identity] = record
+    return pd.DataFrame(rows_by_identity.values())
 
 
-def read_latest_baseline_rows(path: str, pr: pd.DataFrame) -> pd.DataFrame:
+def read_latest_baseline_rows(
+    path: str,
+    pr: pd.DataFrame,
+    baseline_commit_order: list[str] | None = None,
+) -> pd.DataFrame:
     """Read rows from the latest history commit matching the PR benchmark.
 
     A benchmark can be new to the PR workflow and therefore have no baseline
     yet. Return an empty frame with the PR schema in that case so the report
-    can show the measurements without comparison.
+    can show the measurements without comparison. When an exact baseline is
+    requested, never substitute a different develop commit.
     """
 
     pr_identities = set(benchmark_identity_rows(pr)["benchmark_identity"])
@@ -196,6 +233,7 @@ def read_latest_baseline_rows(path: str, pr: pd.DataFrame) -> pd.DataFrame:
         return pd.read_json(path, lines=True)
 
     baseline_commit_id = None
+    matching_commit_ids: set[str] = set()
     with open(path, encoding="utf-8") as lines:
         for line in lines:
             if '"name"' not in line or '"commit_id"' not in line:
@@ -205,14 +243,27 @@ def read_latest_baseline_rows(path: str, pr: pd.DataFrame) -> pd.DataFrame:
                 commit_id = record.get("commit_id")
                 if commit_id is not None:
                     baseline_commit_id = commit_id
+                    matching_commit_ids.add(commit_id)
+
+    if baseline_commit_order is not None:
+        baseline_commit_id = next(
+            (commit_id for commit_id in baseline_commit_order if commit_id in matching_commit_ids),
+            None,
+        )
 
     if baseline_commit_id is None:
+        if baseline_commit_order is not None:
+            raise ValueError("No baseline rows found in the requested commit ancestry")
         return pr.iloc[0:0].copy()
 
     return read_jsonl_rows_for_commit(path, baseline_commit_id)
 
 
-def select_latest_baseline_rows(base: pd.DataFrame, pr: pd.DataFrame) -> pd.DataFrame:
+def select_latest_baseline_rows(
+    base: pd.DataFrame,
+    pr: pd.DataFrame,
+    baseline_commit_order: list[str] | None = None,
+) -> pd.DataFrame:
     """Select rows from the latest baseline commit containing this benchmark.
 
     The persisted benchmark history is append-only. A row only appears after
@@ -225,6 +276,10 @@ def select_latest_baseline_rows(base: pd.DataFrame, pr: pd.DataFrame) -> pd.Data
 
     commit_ids = base["commit_id"].dropna().unique()
     if len(commit_ids) <= 1:
+        if baseline_commit_order is not None and any(
+            commit_id not in baseline_commit_order for commit_id in commit_ids
+        ):
+            raise ValueError("No baseline rows found in the requested commit ancestry")
         return base
 
     pr_identities = set(benchmark_identity_rows(pr)["benchmark_identity"])
@@ -237,7 +292,16 @@ def select_latest_baseline_rows(base: pd.DataFrame, pr: pd.DataFrame) -> pd.Data
     if matches.empty:
         return base.iloc[0:0].copy()
 
-    baseline_commit_id = matches["commit_id"].iloc[-1]
+    if baseline_commit_order is None:
+        baseline_commit_id = matches["commit_id"].iloc[-1]
+    else:
+        matching_commit_ids = set(matches["commit_id"])
+        baseline_commit_id = next(
+            (commit_id for commit_id in baseline_commit_order if commit_id in matching_commit_ids),
+            None,
+        )
+        if baseline_commit_id is None:
+            raise ValueError("No baseline rows found in the requested commit ancestry")
     return base[base["commit_id"] == baseline_commit_id].copy()
 
 
@@ -261,7 +325,7 @@ def normalize_measurement_rows(df: pd.DataFrame) -> pd.DataFrame:
         columns=["engine", "file_format", "query"],
         index=df.index,
     )
-    df["query"] = pd.array(df["query"], dtype="Int64")
+    df["query"] = df["query"].astype(object)
     return df
 
 
@@ -422,7 +486,7 @@ def build_statistical_analysis(df: pd.DataFrame, threshold_pct: int) -> dict[str
         rows.append(
             {
                 "name": row["name"],
-                "query": int(row["query"]),
+                "query": row["query"],
                 "engine": row["engine"],
                 "file_format": row["file_format"],
                 "combo": f"{row['engine']}:{row['file_format']}",
@@ -442,7 +506,7 @@ def build_statistical_analysis(df: pd.DataFrame, threshold_pct: int) -> dict[str
         beta_log_ratio = float(group["log_ratio"].mean())
         query_rows.append(
             {
-                "query": int(query),
+                "query": query,
                 "beta_log_ratio": beta_log_ratio,
                 "beta_ratio": float(np.exp(beta_log_ratio)),
                 "beta_log_se": mean_with_standard_error(group, "log_ratio", "log_ratio_se"),
@@ -914,11 +978,21 @@ def group_sort_key(group_key: tuple[str, str, str]) -> tuple[int, int, int, str,
 def main() -> None:
     """Render the benchmark comparison markdown used in CI PR comments."""
 
-    benchmark_name = sys.argv[3] if len(sys.argv) > 3 else ""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("base_path")
+    parser.add_argument("pr_path")
+    parser.add_argument("benchmark_name", nargs="?", default="")
+    parser.add_argument(
+        "--baseline-commit",
+        help="Exact develop commit whose benchmark results must be used",
+    )
+    args = parser.parse_args()
 
-    pr = pd.read_json(sys.argv[2], lines=True)
-    title = format_title(benchmark_name, pr)
-    base = read_latest_baseline_rows(sys.argv[1], pr)
+    baseline_commit_order = [args.baseline_commit] if args.baseline_commit else None
+
+    pr = pd.read_json(args.pr_path, lines=True)
+    title = format_title(args.benchmark_name, pr)
+    base = read_latest_baseline_rows(args.base_path, pr, baseline_commit_order)
 
     base_commit_ids = set(base["commit_id"].unique())
     pr_commit_id = set(pr["commit_id"].unique())
@@ -938,7 +1012,7 @@ def main() -> None:
     df3["unit"] = df3["unit"].fillna("unit")
     df3["ratio"] = df3["value_pr"] / df3["value_base"]
 
-    is_s3_benchmark = "s3" in benchmark_name.lower()
+    is_s3_benchmark = "s3" in args.benchmark_name.lower()
     threshold_pct = 30 if is_s3_benchmark else 10
     improvement_threshold = 1.0 - (threshold_pct / 100.0)
     regression_threshold = 1.0 + (threshold_pct / 100.0)

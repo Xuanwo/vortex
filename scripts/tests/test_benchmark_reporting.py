@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare-benchmark-jsons.py"
@@ -202,6 +203,62 @@ def test_read_latest_baseline_rows_streams_latest_matching_benchmark_commit(tmp_
     assert len(selected) == 2
 
 
+def test_read_latest_baseline_rows_uses_requested_base_commit(tmp_path: Path) -> None:
+    compare = load_compare_module()
+    history_path = tmp_path / "history.jsonl"
+    history_rows = [
+        stored_timing_row("base-ancestor", "tpch_q01/datafusion:parquet", 100),
+        stored_timing_row("future-develop", "tpch_q01/datafusion:parquet", 90),
+    ]
+    history_path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in history_rows),
+        encoding="utf-8",
+    )
+    pr = pd.DataFrame([stored_timing_row("pr-sha", "tpch_q01/datafusion:parquet", 105)])
+
+    selected = compare.read_latest_baseline_rows(
+        history_path,
+        pr,
+        ["base-ancestor"],
+    )
+
+    assert set(selected["commit_id"]) == {"base-ancestor"}
+
+
+def test_read_latest_baseline_rows_does_not_fall_back_from_requested_commit(tmp_path: Path) -> None:
+    compare = load_compare_module()
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        f"{json.dumps(stored_timing_row('other-commit', 'tpch_q01/datafusion:parquet', 100))}\n",
+        encoding="utf-8",
+    )
+    pr = pd.DataFrame([stored_timing_row("pr-sha", "tpch_q01/datafusion:parquet", 105)])
+
+    with pytest.raises(ValueError, match="No baseline rows found"):
+        compare.read_latest_baseline_rows(history_path, pr, ["requested-base"])
+
+
+def test_read_latest_baseline_rows_uses_last_result_from_rerun(tmp_path: Path) -> None:
+    compare = load_compare_module()
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        "".join(
+            f"{json.dumps(row)}\n"
+            for row in [
+                stored_timing_row("base", "tpch_q01/datafusion:parquet", 100),
+                stored_timing_row("base", "tpch_q01/datafusion:parquet", 110),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pr = pd.DataFrame([stored_timing_row("pr", "tpch_q01/datafusion:parquet", 105)])
+
+    selected = compare.read_latest_baseline_rows(history_path, pr, ["base"])
+
+    assert len(selected) == 1
+    assert selected.iloc[0]["value"] == 110
+
+
 def test_within_engine_analysis_uses_each_engines_own_parquet_control() -> None:
     compare = load_compare_module()
     rows = [
@@ -218,6 +275,27 @@ def test_within_engine_analysis_uses_each_engines_own_parquet_control() -> None:
     assert set(analyses) == {"datafusion", "duckdb"}
     assert compare.build_verdict(analyses["datafusion"])["impact"] == "-10.0%"
     assert compare.build_verdict(analyses["duckdb"])["impact"] == "+20.0%"
+
+
+def test_random_access_rows_use_matching_parquet_controls() -> None:
+    compare = load_compare_module()
+    rows = [
+        timing_row("random-access/taxi/correlated/parquet-tokio-local-disk", 100, 110),
+        timing_row("random-access/taxi/correlated/vortex-tokio-local-disk", 100, 99),
+        timing_row("random-access/taxi/uniform/parquet-tokio-local-disk", 100, 110),
+        timing_row("random-access/taxi/uniform/vortex-tokio-local-disk", 100, 99),
+    ]
+    df = pd.DataFrame(rows)
+    df[["engine", "file_format", "query"]] = df["name"].apply(compare.extract_target_fields)
+
+    analyses = compare.build_within_engine_statistical_analyses(df, threshold_pct=5)
+
+    assert set(analyses) == {"random-access"}
+    assert set(analyses["random-access"]["detail_df"]["file_format"]) == {
+        "parquet",
+        "vortex-file-compressed",
+    }
+    assert compare.build_verdict(analyses["random-access"])["status"] == "Likely improvement"
 
 
 def test_comparison_report_groups_by_target_and_unit(tmp_path: Path) -> None:

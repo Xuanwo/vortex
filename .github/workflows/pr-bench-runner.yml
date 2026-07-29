@@ -41,7 +41,9 @@ jobs:
           sccache: s3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Benchmark the synthetic merge commit so the measured code includes
+          # the exact base revision used by this pull_request event.
+          ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -78,7 +80,7 @@ jobs:
         uses: polarsignals/gh-actions-ps-profiling@68ae857e375a826606352016e5b90f01a2a7ff7a  # v0.8.1
         with:
           polarsignals_cloud_token: ${{ secrets.POLAR_SIGNALS_API_KEY }}
-          labels: "branch=${{ github.ref_name }};gh_run_id=${{ github.run_id }};commit_sha=${{ github.event.pull_request.head.sha }};benchmark=${{ inputs.benchmark_id }}"
+          labels: "branch=${{ github.ref_name }};gh_run_id=${{ github.run_id }};commit_sha=${{ github.sha }};benchmark=${{ inputs.benchmark_id }}"
           project_uuid: "e5d846e1-b54c-46e7-9174-8bf055a3af56"
           job_name: "${{ inputs.benchmark_id }}"
           profiling_frequency: 199
@@ -122,14 +124,33 @@ jobs:
 
       - name: Compare results
         shell: bash
+        env:
+          BASELINE_COMMIT: ${{ github.event.pull_request.base.sha }}
         run: |
           set -Eeu -o pipefail -x
 
-          python3 scripts/s3-download.py s3://vortex-ci-benchmark-results/data.json.gz data.json.gz --no-sign-request
-          gzip -d -c data.json.gz > base.json
+          baseline_args=()
+          if [[ -n "$BASELINE_COMMIT" ]]; then
+            baseline_args+=(--baseline-commit "$BASELINE_COMMIT")
+          fi
 
-          uv run --no-project scripts/compare-benchmark-jsons.py base.json results.json "${{ inputs.benchmark_name }}" \
-            > comment.md
+          for attempt in {1..40}; do
+            python3 scripts/s3-download.py \
+              s3://vortex-ci-benchmark-results/data.json.gz data.json.gz --no-sign-request
+            gzip -d -c data.json.gz > base.json
+
+            if uv run --no-project scripts/compare-benchmark-jsons.py \
+              base.json results.json "${{ inputs.benchmark_name }}" "${baseline_args[@]}" \
+              > comment.md 2> compare.err; then
+              break
+            fi
+            if ! grep -q "No baseline rows found" compare.err || (( attempt == 40 )); then
+              cat compare.err >&2
+              exit 1
+            fi
+            echo "Waiting for benchmark results from base commit $BASELINE_COMMIT"
+            sleep 60
+          done
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment PR
