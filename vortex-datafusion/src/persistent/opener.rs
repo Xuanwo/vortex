@@ -40,7 +40,10 @@ use futures::stream;
 use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
+use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::Chunked;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
@@ -440,11 +443,19 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
+                // Convert each natural chunk separately: chunk children are independently
+                // decodable, so this skips the chunk-of-struct swizzle and per-column concat
+                // that whole-split conversion pays, without re-decoding shared encoding state
+                // the way slicing the still-lazy array would.
                 .map_ok(move |chunk| {
-                    stream::iter((0..chunk.len()).step_by(batch_size).map(move |start| {
-                        let end = start.saturating_add(batch_size).min(chunk.len());
-                        chunk.slice(start..end)
-                    }))
+                    let chunks: Vec<ArrayRef> = if let Some(chunked) = chunk.as_opt::<Chunked>() {
+                        chunked.non_empty_chunks().cloned().collect()
+                    } else if chunk.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![chunk]
+                    };
+                    stream::iter(chunks.into_iter().map(Ok::<_, VortexError>))
                 })
                 .try_flatten()
                 // Convert to Arrow inline on the polling thread: DataFusion sources are expected
@@ -463,7 +474,7 @@ impl FileOpener for VortexOpener {
                     })
                 })
                 .map_err(move |e: VortexError| vortex_file_read_error(&file_location, e))
-                .map(move |batch| {
+                .map(move |batch| -> DFResult<RecordBatch> {
                     let batch = if projector.projection().as_ref().is_empty() {
                         batch
                     } else {
@@ -478,6 +489,21 @@ impl FileOpener for VortexOpener {
                     )
                     .map_err(Into::into)
                 })
+                // Natural chunks may exceed the requested batch size; slice the already
+                // converted batch, which is zero-copy in Arrow.
+                .map_ok(move |batch| {
+                    let rows = batch.num_rows();
+                    let slices: Vec<DFResult<RecordBatch>> = if rows > batch_size {
+                        (0..rows)
+                            .step_by(batch_size)
+                            .map(|start| Ok(batch.slice(start, batch_size.min(rows - start))))
+                            .collect()
+                    } else {
+                        vec![Ok(batch)]
+                    };
+                    stream::iter(slices)
+                })
+                .try_flatten()
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {
