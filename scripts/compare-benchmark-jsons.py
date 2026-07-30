@@ -646,7 +646,7 @@ def format_pct_change(pct: float) -> str:
 
 
 def extract_file_size_data(df: pd.DataFrame) -> dict[tuple[str, str, str, str], int]:
-    """Extract file-size rows keyed by benchmark, scale factor, format, and file."""
+    """Extract nonzero file-size rows keyed by benchmark, scale factor, format, and file."""
 
     data = {}
     if df.empty:
@@ -666,7 +666,10 @@ def extract_file_size_data(df: pd.DataFrame) -> dict[tuple[str, str, str, str], 
         value = row.get("value")
         if pd.isna(value):
             continue
-        data[key] = int(value)
+        size = int(value)
+        if size == 0:
+            continue
+        data[key] = size
 
     return data
 

@@ -428,6 +428,17 @@ def test_file_size_report_reads_shared_benchmark_rows() -> None:
     assert "| part-0.vortex | 10 | vortex-file-compressed | 100 B | 125 B | +25 B | +25.0% |" in report
 
 
+def test_file_size_report_ignores_zero_byte_files() -> None:
+    compare = load_compare_module()
+
+    report = compare.format_file_size_report(
+        pd.DataFrame([file_size_record("base-sha", 0)]),
+        pd.DataFrame([file_size_record("pr-sha", 0)]),
+    )
+
+    assert report == ""
+
+
 def test_file_size_report_ignores_baseline_rows_outside_pr_scope() -> None:
     compare = load_compare_module()
 
