@@ -40,10 +40,7 @@ use futures::stream;
 use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
-use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::Chunked;
-use vortex::array::arrays::chunked::ChunkedArrayExt;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
@@ -436,7 +433,6 @@ impl FileOpener for VortexOpener {
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
             let file_location = file.object_meta.location.clone();
-            let split_session = session.clone();
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -444,28 +440,6 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
-                // Convert each natural chunk separately: chunk children are independently
-                // decodable, so this skips the chunk-of-struct swizzle and per-column concat
-                // that whole-split conversion pays, without re-decoding shared encoding state
-                // the way slicing the still-lazy array would. Lazy wrappers are executed away
-                // first, since e.g. Filter/Mask/Slice over Chunked distribute per child while
-                // hiding the chunked structure from a literal downcast.
-                .map(move |chunk| {
-                    chunk.and_then(|chunk| {
-                        let mut ctx = split_session.create_execution_ctx();
-                        let chunk = chunk.execute_until::<Chunked>(&mut ctx)?;
-                        let chunks: Vec<ArrayRef> = if let Some(chunked) = chunk.as_opt::<Chunked>()
-                        {
-                            chunked.non_empty_chunks().cloned().collect()
-                        } else if chunk.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![chunk]
-                        };
-                        Ok(stream::iter(chunks.into_iter().map(Ok::<_, VortexError>)))
-                    })
-                })
-                .try_flatten()
                 // Convert to Arrow inline on the polling thread: DataFusion sources are expected
                 // to do their CPU work inside `poll_next`, and spawning this onto the blocking
                 // pool oversubscribes the CPU.
@@ -534,11 +508,13 @@ fn natural_split_ranges_for_file(
         return Ok(Arc::clone(split_ranges.value()));
     }
 
-    let split_ranges = compute_natural_split_ranges(layout_reader.as_ref())?;
-
+    // Compute while holding the entry so concurrent partitions opening the same file wait
+    // for the winner instead of all walking the layout tree; the redundant walks contend on
+    // the lazily-initialized layout children and dominate the cost of the computation itself.
     match natural_split_ranges.entry(path.clone()) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
+            let split_ranges = compute_natural_split_ranges(layout_reader.as_ref())?;
             entry.insert(Arc::clone(&split_ranges));
             Ok(split_ranges)
         }
