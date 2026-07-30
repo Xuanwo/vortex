@@ -9472,6 +9472,7 @@ dependencies = [
  "vortex-error",
  "vortex-fsst",
  "vortex-mask",
+ "vortex-onpair",
  "vortex-runend",
  "vortex-session",
  "vortex-zstd",
