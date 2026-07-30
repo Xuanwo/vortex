@@ -394,7 +394,7 @@ impl RepeatedScan {
                         if range.is_empty() {
                             return Vec::new();
                         }
-                        let lo = vec.partition_point(|&x| x < range.start);
+                        let lo = vec.partition_point(|&x| x <= range.start);
                         let hi = vec.partition_point(|&x| x < range.end);
                         Either::Right(
                             iter::once(range.start)
