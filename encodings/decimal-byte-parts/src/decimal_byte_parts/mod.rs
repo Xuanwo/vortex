@@ -285,10 +285,6 @@ impl DecimalBytePartsData {
         vortex_ensure!(msp.len() == len, "expected len {len}, got {}", msp.len());
 
         let lower_part_count = lower_parts.len();
-        vortex_ensure!(
-            lower_part_count <= MAX_LOWER_PARTS,
-            "at most {MAX_LOWER_PARTS} lower parts are supported, got {lower_part_count}"
-        );
         for (idx, part) in lower_parts.enumerate() {
             vortex_ensure!(
                 part.dtype() == &LOWER_PART_DTYPE,
@@ -301,8 +297,20 @@ impl DecimalBytePartsData {
                 part.len()
             );
         }
-        // Rejects part combinations that cannot be reassembled into a decimal value.
-        assembled_values_type(msp.dtype().as_ptype(), lower_part_count)?;
+        // Rejects part combinations that cannot be reassembled into a decimal value. This also
+        // bounds the lower part count.
+        let values_type = assembled_values_type(msp.dtype().as_ptype(), lower_part_count)?;
+
+        // The parts must not assemble into a wider value than the declared precision holds.
+        // Without this, a crafted array carrying more parts than its precision needs
+        // canonicalizes to out-of-precision values that then panic in the scalar path.
+        let widest = DecimalType::smallest_decimal_value_type(&decimal_dtype);
+        vortex_ensure!(
+            values_type <= widest,
+            "parts assemble into {values_type:?}, wider than the {widest:?} required by \
+             decimal precision {}",
+            decimal_dtype.precision()
+        );
         Ok(())
     }
 }
@@ -677,52 +685,26 @@ mod tests {
         buffer![1u64, 2, 3].into_array()
     }
 
-    #[test]
-    fn test_rejects_signed_lower_part() {
+    #[rstest]
+    #[case::signed_lower_part(vec![buffer![1i64, 2, 3].into_array()], DecimalDType::new(38, 2))]
+    #[case::nullable_lower_part(
+        vec![PrimitiveArray::new(buffer![1u64, 2, 3], Validity::AllValid).into_array()],
+        DecimalDType::new(38, 2)
+    )]
+    #[case::mismatched_length(vec![buffer![1u64, 2].into_array()], DecimalDType::new(38, 2))]
+    #[case::too_many_parts(
+        vec![lower_part(), lower_part(), lower_part(), lower_part()],
+        DecimalDType::new(76, 2)
+    )]
+    // Parts assembling into an i256 under a precision that only needs i128 would canonicalize
+    // to values outside the declared precision.
+    #[case::wider_than_precision(vec![lower_part(), lower_part()], DecimalDType::new(38, 2))]
+    fn test_rejects_invalid_parts(
+        #[case] lower_parts: Vec<ArrayRef>,
+        #[case] decimal_dtype: DecimalDType,
+    ) {
         assert!(
-            DecimalByteParts::try_new_with_lower_parts(
-                msp(),
-                vec![buffer![1i64, 2, 3].into_array()],
-                DecimalDType::new(38, 2),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn test_rejects_nullable_lower_part() {
-        let nullable = PrimitiveArray::new(buffer![1u64, 2, 3], Validity::AllValid).into_array();
-        assert!(
-            DecimalByteParts::try_new_with_lower_parts(
-                msp(),
-                vec![nullable],
-                DecimalDType::new(38, 2),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn test_rejects_mismatched_lower_part_length() {
-        assert!(
-            DecimalByteParts::try_new_with_lower_parts(
-                msp(),
-                vec![buffer![1u64, 2].into_array()],
-                DecimalDType::new(38, 2),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn test_rejects_too_many_lower_parts() {
-        assert!(
-            DecimalByteParts::try_new_with_lower_parts(
-                msp(),
-                vec![lower_part(), lower_part(), lower_part(), lower_part()],
-                DecimalDType::new(76, 2),
-            )
-            .is_err()
+            DecimalByteParts::try_new_with_lower_parts(msp(), lower_parts, decimal_dtype).is_err()
         );
     }
 
@@ -757,6 +739,16 @@ mod tests {
             &[(1i128 << 64) | 1, (2i128 << 64) | 2, (3i128 << 64) | 3]
         );
         Ok(())
+    }
+
+    /// A crafted file may declare more lower parts than its precision needs. Assembling those
+    /// parts would produce values outside the declared precision, so it must be rejected at
+    /// deserialization rather than panicking later in the scalar path.
+    #[test]
+    fn test_deserialize_rejects_parts_wider_than_precision() {
+        let result = deserialize_with(2, vec![msp(), lower_part(), lower_part()])
+            .and_then(Array::try_from_parts);
+        assert!(result.is_err(), "expected rejection, got {result:?}");
     }
 
     #[test]
