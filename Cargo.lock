@@ -9686,6 +9686,7 @@ dependencies = [
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
 dependencies = [
+ "codspeed-divan-compat",
  "num-traits",
  "prost 0.14.4",
  "rstest",

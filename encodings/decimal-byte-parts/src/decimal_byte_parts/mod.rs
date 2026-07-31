@@ -18,6 +18,7 @@ pub(crate) mod testing;
 pub use limbs::DecimalParts;
 pub use limbs::LOWER_PART_DTYPE;
 pub use limbs::MAX_LOWER_PARTS;
+pub use limbs::assemble_decimal;
 pub use limbs::assembled_values_type;
 pub use limbs::split_decimal;
 use prost::Message as _;
@@ -54,7 +55,6 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::decimal_byte_parts::limbs::assemble_decimal;
 use crate::decimal_byte_parts::limbs::combine_i128;
 use crate::decimal_byte_parts::limbs::combine_i256;
 use crate::decimal_byte_parts::rules::PARENT_RULES;

@@ -32,6 +32,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 
 /// The maximum number of lower parts an encoded decimal can carry.
 ///
@@ -130,18 +131,40 @@ pub fn assemble_decimal(
         }));
     }
 
+    // Slice every part to the MSP's length up front: the assembly loops then index slices the
+    // compiler knows are long enough, so the per-row bounds checks fall away.
+    let len = msp.len();
     let lower: Vec<&[u64]> = lower_parts
         .iter()
-        .map(|part| part.as_slice::<u64>())
-        .collect();
-    Ok(
-        match assembled_values_type(msp.ptype(), lower_parts.len())? {
-            DecimalType::I256 => {
-                DecimalArray::new(assemble_i256(msp, &lower), decimal_dtype, validity)
-            }
-            _ => DecimalArray::new(assemble_i128(msp, &lower), decimal_dtype, validity),
+        .map(|part| {
+            let part = part.as_slice::<u64>();
+            vortex_ensure!(
+                part.len() >= len,
+                "lower part has len {}, expected at least {len}",
+                part.len()
+            );
+            Ok(&part[..len])
+        })
+        .collect::<VortexResult<_>>()?;
+
+    // The part count is dispatched to a constant so every 64-bit word lands at a compile-time
+    // index. Leaving it dynamic costs 1.8x on the `i256` path — see `benches/decimal_assemble.rs`.
+    let values = match assembled_values_type(msp.ptype(), lower.len())? {
+        DecimalType::I256 => match lower.as_slice() {
+            [first] => assemble_i256(msp, [first]),
+            [first, second] => assemble_i256(msp, [first, second]),
+            [first, second, third] => assemble_i256(msp, [first, second, third]),
+            _ => vortex_bail!("unsupported lower part count {}", lower.len()),
         },
-    )
+        _ => {
+            return Ok(DecimalArray::new(
+                assemble_i128(msp, lower[0]),
+                decimal_dtype,
+                validity,
+            ));
+        }
+    };
+    Ok(DecimalArray::new(values, decimal_dtype, validity))
 }
 
 /// Combine a single row's parts into an `i128`.
@@ -231,38 +254,43 @@ fn split_i256(values: &Buffer<i256>) -> (Buffer<i64>, [Buffer<u64>; MAX_LOWER_PA
     (msp.freeze(), lower.map(BufferMut::freeze))
 }
 
+/// Only one lower part can share 128 bits with a signed MSP, so this shape is fixed.
 #[expect(
     clippy::useless_conversion,
     reason = "the widening to i64 is a no-op only for the i64 arm of the ptype match"
 )]
-fn assemble_i128(msp: &PrimitiveArray, lower: &[&[u64]]) -> Buffer<i128> {
-    let len = msp.len();
-    let mut out = BufferMut::<i128>::with_capacity(len);
+fn assemble_i128(msp: &PrimitiveArray, lower: &[u64]) -> Buffer<i128> {
+    let mut out = BufferMut::<i128>::with_capacity(msp.len());
     match_each_signed_integer_ptype!(msp.ptype(), |P| {
-        let values = msp.as_slice::<P>();
-        for (row, value) in values.iter().enumerate() {
-            out.push(combine_i128(
-                i64::from(*value),
-                lower.iter().map(|part| part[row]),
-            ));
+        for (value, part) in msp.as_slice::<P>().iter().zip(lower) {
+            out.push((i128::from(i64::from(*value)) << LOWER_PART_BITS) | i128::from(*part));
         }
     });
     out.freeze()
 }
 
+/// The lower parts fill the least significant 64-bit words, the MSP the word above them, and
+/// the remaining high words are the MSP's sign extension.
+///
+/// `K` is a constant so the word indices are compile-time constants and the placement loop
+/// unrolls; the same loop with a runtime part count is 1.8x slower.
 #[expect(
     clippy::useless_conversion,
     reason = "the widening to i64 is a no-op only for the i64 arm of the ptype match"
 )]
-fn assemble_i256(msp: &PrimitiveArray, lower: &[&[u64]]) -> Buffer<i256> {
-    let len = msp.len();
-    let mut out = BufferMut::<i256>::with_capacity(len);
+fn assemble_i256<const K: usize>(msp: &PrimitiveArray, lower: [&[u64]; K]) -> Buffer<i256> {
+    let mut out = BufferMut::<i256>::with_capacity(msp.len());
     match_each_signed_integer_ptype!(msp.ptype(), |P| {
-        let values = msp.as_slice::<P>();
-        for (row, value) in values.iter().enumerate() {
-            out.push(combine_i256(
-                i64::from(*value),
-                lower.iter().map(|part| part[row]),
+        for (row, value) in msp.as_slice::<P>().iter().enumerate() {
+            let value = i64::from(*value);
+            let mut words = [if value < 0 { u64::MAX } else { 0 }; 4];
+            for (i, part) in lower.iter().enumerate() {
+                words[K - 1 - i] = part[row];
+            }
+            words[K] = value.cast_unsigned();
+            out.push(i256::from_parts(
+                u128::from(words[0]) | (u128::from(words[1]) << LOWER_PART_BITS),
+                (u128::from(words[2]) | (u128::from(words[3]) << LOWER_PART_BITS)).cast_signed(),
             ));
         }
     });
