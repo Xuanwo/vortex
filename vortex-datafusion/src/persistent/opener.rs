@@ -382,9 +382,7 @@ impl FileOpener for VortexOpener {
                         return Ok(stream::empty().boxed());
                     };
 
-                    scan_builder = scan_builder
-                        .with_row_range(row_range)
-                        .with_natural_splits(Arc::clone(&natural_splits.row_boundaries));
+                    scan_builder = scan_builder.with_row_range(row_range);
                 }
             }
 
