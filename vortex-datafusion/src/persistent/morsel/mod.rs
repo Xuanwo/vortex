@@ -44,7 +44,6 @@ use datafusion_pruning::FilePruner;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
-use itertools::Itertools;
 use object_store::path::Path;
 use tokio::sync::OnceCell;
 use tracing::Instrument;
@@ -79,8 +78,52 @@ use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::stream::PrunableStream;
 use crate::reader::VortexReaderFactory;
 
-pub(crate) type NaturalSplitRanges = Arc<[Range<u64>]>;
-pub(crate) type NaturalSplitCache = DashMap<Path, Arc<OnceCell<NaturalSplitRanges>>>;
+pub(crate) type NaturalSplitCache = DashMap<Path, Arc<OnceCell<Arc<NaturalSplits>>>>;
+
+/// A file's natural split boundaries, with each split's byte assignment precomputed.
+///
+/// `row_boundaries` is the sorted, deduplicated split point list covering the whole file.
+/// `assignment_bytes` holds the byte that owns each split (see [`split_assignment_byte`]) and is
+/// sorted, so translating a DataFusion byte range into rows is two binary searches rather than a
+/// scan over every split.
+#[derive(Debug)]
+pub(crate) struct NaturalSplits {
+    row_boundaries: Arc<[u64]>,
+    assignment_bytes: Box<[u64]>,
+}
+
+impl NaturalSplits {
+    fn new(row_boundaries: Arc<[u64]>, total_size: u64) -> Self {
+        let row_count = row_boundaries.last().copied().unwrap_or_default();
+        let assignment_bytes = if row_count == 0 {
+            Box::default()
+        } else {
+            row_boundaries
+                .windows(2)
+                .enumerate()
+                .map(|(idx, boundaries)| {
+                    split_assignment_byte(
+                        idx,
+                        &(boundaries[0]..boundaries[1]),
+                        row_count,
+                        total_size,
+                    )
+                })
+                .collect()
+        };
+
+        debug_assert!(assignment_bytes.is_sorted());
+        debug_assert_eq!(
+            assignment_bytes.len() + usize::from(!row_boundaries.is_empty()),
+            row_boundaries.len()
+        );
+
+        Self {
+            row_boundaries,
+            assignment_bytes,
+        }
+    }
+}
 
 /// Creates morsel planners for Vortex files.
 pub struct VortexMorselizer {
@@ -114,7 +157,7 @@ pub struct VortexMorselizer {
     /// a file reader the first time we read a file.
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
-    pub natural_split_ranges: Arc<NaturalSplitCache>,
+    pub(crate) natural_splits: Arc<NaturalSplitCache>,
     /// Whether the query has output ordering specified
     pub has_output_ordering: bool,
 
@@ -139,7 +182,7 @@ impl std::fmt::Debug for VortexMorselizer {
             .field("limit", &self.limit)
             .field("df_metrics", &self.df_metrics)
             .field("layout_readers", &self.layout_readers)
-            .field("natural_split_ranges", &self.natural_split_ranges)
+            .field("natural_splits", &self.natural_splits)
             .field("has_output_ordering", &self.has_output_ordering)
             .field("file_metadata_cache", &self.file_metadata_cache)
             .field("projection_pushdown", &self.projection_pushdown)
@@ -194,7 +237,7 @@ impl VortexMorselPlanner {
         let unified_file_schema = Arc::clone(morselizer.table_schema.file_schema());
         let limit = morselizer.limit;
         let layout_readers = Arc::clone(&morselizer.layout_readers);
-        let natural_split_ranges = Arc::clone(&morselizer.natural_split_ranges);
+        let natural_splits = Arc::clone(&morselizer.natural_splits);
         let has_output_ordering = morselizer.has_output_ordering;
         let scan_concurrency = morselizer.scan_concurrency;
 
@@ -273,7 +316,7 @@ impl VortexMorselPlanner {
                     unified_file_schema,
                     limit,
                     layout_readers,
-                    natural_split_ranges,
+                    natural_splits,
                     has_output_ordering,
                     expr_convertor,
                     projection_pushdown,
@@ -299,7 +342,7 @@ struct FileOpenState {
     unified_file_schema: SchemaRef,
     limit: Option<u64>,
     layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
-    natural_split_ranges: Arc<NaturalSplitCache>,
+    natural_splits: Arc<NaturalSplitCache>,
     has_output_ordering: bool,
     expr_convertor: Arc<dyn ExpressionConvertor>,
     projection_pushdown: bool,
@@ -326,7 +369,7 @@ enum State {
         vxf: VortexFile,
         layout_reader: Arc<dyn LayoutReader>,
         byte_range: Range<u64>,
-        split_ranges: Arc<OnceCell<NaturalSplitRanges>>,
+        split_ranges: Arc<OnceCell<Arc<NaturalSplits>>>,
     },
     PrepareScan {
         state: FileOpenState,
@@ -457,7 +500,7 @@ impl std::fmt::Debug for FileOpenState {
             .field("unified_file_schema", &self.unified_file_schema)
             .field("limit", &self.limit)
             .field("layout_readers", &self.layout_readers)
-            .field("natural_split_ranges", &self.natural_split_ranges)
+            .field("natural_splits", &self.natural_splits)
             .field("has_output_ordering", &self.has_output_ordering)
             .field("expr_convertor", &"<expr_convertor>")
             .field("projection_pushdown", &self.projection_pushdown)
@@ -563,7 +606,7 @@ impl MorselPlanner for VortexMorselPlanner {
                 };
 
                 let split_ranges = natural_split_cell_for_file(
-                    state.natural_split_ranges.as_ref(),
+                    state.natural_splits.as_ref(),
                     &state.file.object_meta.location,
                 );
 
@@ -591,16 +634,17 @@ impl MorselPlanner for VortexMorselPlanner {
                 Ok(Some(
                     MorselPlan::new().with_pending_planner(
                         async move {
-                            let split_ranges = split_ranges
-                                .get_or_try_init(|| async {
-                                    compute_natural_split_ranges(layout_reader.as_ref())
-                                })
-                                .await?;
+                            let natural_splits = Arc::clone(
+                                split_ranges
+                                    .get_or_try_init(|| async {
+                                        compute_natural_splits(layout_reader.as_ref(), total_size)
+                                    })
+                                    .await?,
+                            );
 
                             let new_state = match split_aligned_row_range(
                                 byte_range,
-                                total_size,
-                                split_ranges.as_ref(),
+                                natural_splits.as_ref(),
                             ) {
                                 Some(row_range) => State::PrepareScan {
                                     state,
@@ -899,10 +943,10 @@ fn partial_file_byte_range(file: &PartitionedFile) -> DFResult<Option<Range<u64>
 }
 
 fn natural_split_cell_for_file(
-    natural_split_ranges: &NaturalSplitCache,
+    natural_splits: &NaturalSplitCache,
     path: &Path,
-) -> Arc<OnceCell<NaturalSplitRanges>> {
-    match natural_split_ranges.entry(path.clone()) {
+) -> Arc<OnceCell<Arc<NaturalSplits>>> {
+    match natural_splits.entry(path.clone()) {
         Entry::Occupied(entry) => Arc::clone(entry.get()),
         Entry::Vacant(entry) => {
             let split_ranges = Arc::new(OnceCell::new());
@@ -912,18 +956,20 @@ fn natural_split_cell_for_file(
     }
 }
 
-fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<NaturalSplitRanges> {
+fn compute_natural_splits(
+    layout_reader: &dyn LayoutReader,
+    total_size: u64,
+) -> DFResult<Arc<NaturalSplits>> {
     let row_count = layout_reader.row_count();
     let row_range = 0..row_count;
-    let split_points: Vec<_> = SplitBy::Layout
+    let row_boundaries = SplitBy::Layout
         .splits(layout_reader, &row_range, &[FieldMask::All])
-        .map_err(|e| exec_datafusion_err!("Failed to compute Vortex natural splits: {e}"))?
-        .into_iter()
-        .tuple_windows()
-        .map(|(s, e)| s..e)
-        .collect::<Vec<_>>();
+        .map_err(|e| exec_datafusion_err!("Failed to compute Vortex natural splits: {e}"))?;
 
-    Ok(split_points.into())
+    Ok(Arc::new(NaturalSplits::new(
+        row_boundaries.into(),
+        total_size,
+    )))
 }
 
 /// Translate a DataFusion byte range to the contiguous natural split ranges it owns.
@@ -931,33 +977,25 @@ fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Na
 /// byte 0 so a tiny first byte range still claims the first rows.
 fn split_aligned_row_range(
     byte_range: Range<u64>,
-    total_size: u64,
-    split_ranges: &[Range<u64>],
+    natural_splits: &NaturalSplits,
 ) -> Option<Range<u64>> {
     if byte_range.start >= byte_range.end {
         return None;
     }
 
-    let row_count = split_ranges.last().map(|split| split.end)?;
-    if row_count == 0 {
+    let first_split = natural_splits
+        .assignment_bytes
+        .partition_point(|&assignment_byte| assignment_byte < byte_range.start);
+    let after_last_split = natural_splits
+        .assignment_bytes
+        .partition_point(|&assignment_byte| assignment_byte < byte_range.end);
+    if first_split == after_last_split {
         return None;
     }
 
-    let mut owned_splits = split_ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, split_range)| {
-            let assignment_byte = split_assignment_byte(idx, split_range, row_count, total_size);
-            byte_range.contains(&assignment_byte).then_some(split_range)
-        });
-
-    let first_split = owned_splits.next()?;
-    let mut row_range = first_split.start..first_split.end;
-    for split_range in owned_splits {
-        row_range.end = split_range.end;
-    }
-
-    Some(row_range)
+    Some(
+        natural_splits.row_boundaries[first_split]..natural_splits.row_boundaries[after_last_split],
+    )
 }
 
 fn split_assignment_byte(
