@@ -37,15 +37,17 @@ impl ArrayParentReduceRule<DecimalByteParts> for DecimalBytePartsFilterPushDownR
         parent: ArrayView<'_, Filter>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
-        // TODO(ngates): we should benchmark whether to push-down filters with "lower parts".
-        //  For now, we only push down if there are no lower parts.
-        if !child._lower_parts.is_empty() {
-            return Ok(None);
-        }
-
+        // TODO(ngates): we should benchmark whether to push-down filters with "lower parts",
+        //  which filters each part separately rather than the canonical wide buffer once.
         let new_msp = child.msp().filter(parent.filter_mask().clone())?;
-        let new_child = DecimalByteParts::try_new(
+        let new_lower_parts = child
+            .lower_parts()
+            .iter()
+            .map(|part| part.filter(parent.filter_mask().clone()))
+            .collect::<VortexResult<Vec<_>>>()?;
+        let new_child = DecimalByteParts::try_new_with_lower_parts(
             new_msp,
+            new_lower_parts,
             *child
                 .dtype()
                 .as_decimal_opt()

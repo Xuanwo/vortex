@@ -10,12 +10,12 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::arrays::DecimalArray;
-use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::decimal::narrowed_decimal;
-use vortex_array::dtype::DecimalType;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_decimal_byte_parts::DecimalByteParts;
+use vortex_decimal_byte_parts::MAX_LOWER_PARTS;
+use vortex_decimal_byte_parts::split_decimal;
 use vortex_error::VortexResult;
 
 use crate::ArrayAndStats;
@@ -28,6 +28,10 @@ use crate::SchemeExt;
 ///
 /// Narrows the decimal to the smallest integer type, compresses the underlying primitive, and wraps
 /// the result in a `DecimalBytePartsArray`.
+///
+/// Values that stay wider than 64 bits after narrowing are split into a signed most
+/// significant part and 64-bit lower parts — one for `i128`, three for `i256` — each of
+/// which is compressed independently.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct DecimalScheme;
 
@@ -44,9 +48,9 @@ impl Scheme for DecimalScheme {
         vec![DecimalByteParts.id()]
     }
 
-    /// Children: primitive=0.
+    /// Children: msp=0, lower parts=1..=3.
     fn num_children(&self) -> usize {
-        1
+        1 + MAX_LOWER_PARTS
     }
 
     fn expected_compression_ratio(
@@ -66,22 +70,24 @@ impl Scheme for DecimalScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        // TODO(joe): add support splitting i128/256 buffers into chunks of primitive values
-        // for compression. 2 for i128 and 4 for i256.
         let decimal = data.array().clone().execute::<DecimalArray>(exec_ctx)?;
         let decimal = narrowed_decimal(decimal);
-        let validity = decimal.validity()?;
-        let prim = match decimal.values_type() {
-            DecimalType::I8 => PrimitiveArray::new(decimal.buffer::<i8>(), validity),
-            DecimalType::I16 => PrimitiveArray::new(decimal.buffer::<i16>(), validity),
-            DecimalType::I32 => PrimitiveArray::new(decimal.buffer::<i32>(), validity),
-            DecimalType::I64 => PrimitiveArray::new(decimal.buffer::<i64>(), validity),
-            _ => return Ok(decimal.into_array()),
-        };
+        let parts = split_decimal(&decimal)?;
 
-        let compressed =
-            compressor.compress_child(&prim.into_array(), &compress_ctx, self.id(), 0, exec_ctx)?;
+        let msp = compressor.compress_child(&parts.msp, &compress_ctx, self.id(), 0, exec_ctx)?;
+        let lower_parts = parts
+            .lower_parts
+            .iter()
+            .enumerate()
+            .map(|(idx, part)| {
+                compressor.compress_child(part, &compress_ctx, self.id(), idx + 1, exec_ctx)
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
 
-        DecimalByteParts::try_new(compressed, decimal.decimal_dtype()).map(|d| d.into_array())
+        DecimalByteParts::try_new_with_lower_parts(msp, lower_parts, decimal.decimal_dtype())
+            .map(|d| d.into_array())
     }
 }
+
+#[cfg(test)]
+mod tests;

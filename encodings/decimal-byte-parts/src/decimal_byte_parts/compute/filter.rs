@@ -13,8 +13,15 @@ use crate::DecimalByteParts;
 use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
 impl FilterReduce for DecimalByteParts {
     fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
-        DecimalByteParts::try_new(
+        let lower_parts = array
+            .lower_parts()
+            .iter()
+            .map(|part| part.filter(mask.clone()))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        DecimalByteParts::try_new_with_lower_parts(
             array.msp().filter(mask.clone())?,
+            lower_parts,
             *array
                 .dtype()
                 .as_decimal_opt()
@@ -32,9 +39,13 @@ mod test {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::filter::test_filter_conformance;
     use vortex_array::dtype::DecimalDType;
+    use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
 
     use crate::DecimalByteParts;
+    use crate::decimal_byte_parts::testing::i128_parts;
+    use crate::decimal_byte_parts::testing::i256_of;
+    use crate::decimal_byte_parts::testing::i256_parts;
 
     #[test]
     fn test_filter_decimal_byte_parts() {
@@ -54,6 +65,33 @@ mod test {
 
         let decimal_dtype = DecimalDType::new(18, 4);
         let array = DecimalByteParts::try_new(msp, decimal_dtype).unwrap();
+        test_filter_conformance(
+            &array.into_array(),
+            &mut array_session().create_execution_ctx(),
+        );
+    }
+
+    #[test]
+    fn test_filter_decimal_byte_parts_with_lower_parts() {
+        let array = i128_parts(
+            vec![1i128 << 70, -(1i128 << 70), 5, (1i128 << 64) - 1, 0],
+            Validity::NonNullable,
+        );
+        test_filter_conformance(
+            &array.into_array(),
+            &mut array_session().create_execution_ctx(),
+        );
+
+        let array = i256_parts(
+            vec![
+                i256_of(1, 0),
+                i256_of(-1, 5),
+                i256_of(0, u128::MAX),
+                i256_of(1 << 64, 7),
+                i256_of(0, 0),
+            ],
+            Validity::from_iter([true, false, true, true, false]),
+        );
         test_filter_conformance(
             &array.into_array(),
             &mut array_session().create_execution_ctx(),

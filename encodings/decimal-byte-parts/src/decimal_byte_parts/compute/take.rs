@@ -18,8 +18,15 @@ impl TakeExecute for DecimalByteParts {
         indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        DecimalByteParts::try_new(
+        let lower_parts = array
+            .lower_parts()
+            .iter()
+            .map(|part| part.take(indices.clone()))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        DecimalByteParts::try_new_with_lower_parts(
             array.msp().take(indices.clone())?,
+            lower_parts,
             *array
                 .dtype()
                 .as_decimal_opt()

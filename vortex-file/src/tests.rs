@@ -36,6 +36,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::PType::I32;
 use vortex_array::dtype::StructFields;
+use vortex_array::dtype::i256;
 use vortex_array::expr::and;
 use vortex_array::expr::cast;
 use vortex_array::expr::col;
@@ -224,6 +225,87 @@ async fn test_round_trip_many_types() {
     let read = ChunkedArray::try_new(chunks, dtype).unwrap();
 
     assert_eq!(read.len(), 3);
+}
+
+/// End-to-end check that decimals wider than 64 bits survive a write/read round trip and are
+/// actually compressed: the compressor splits them into a most significant part plus 64-bit
+/// lower parts, each of which compresses on its own.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
+    const N: usize = 16_384;
+    /// Bytes each value would occupy uncompressed: `i128` plus `i256` storage.
+    const UNCOMPRESSED_BYTES_PER_ROW: usize = 16 + 32;
+
+    /// Deterministic 24-bit noise, so the low bits of each value are neither constant nor a
+    /// sequence.
+    fn noise(seed: u64) -> impl Iterator<Item = i128> {
+        let mut state = seed;
+        iter::repeat_with(move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            i128::from(state >> 40)
+        })
+    }
+
+    // Values that need more than 64 bits, so `i128` storage cannot be narrowed away.
+    let decimal_38 = DecimalArray::new(
+        noise(7)
+            .take(N)
+            .map(|delta| 10i128.pow(25) + delta)
+            .collect::<Buffer<i128>>(),
+        DecimalDType::new(38, 2),
+        Validity::NonNullable,
+    )
+    .into_array();
+
+    // Values that need more than 128 bits, so `i256` storage cannot be narrowed away.
+    let base = i256::from_i128(10).wrapping_pow(40);
+    let decimal_76 = DecimalArray::new(
+        noise(11)
+            .take(N)
+            .map(|delta| base + i256::from_i128(delta))
+            .collect::<Buffer<i256>>(),
+        DecimalDType::new(76, 4),
+        Validity::from_iter((0..N).map(|i| i % 9 != 0)),
+    )
+    .into_array();
+
+    let st = StructArray::from_fields(&[
+        ("decimal_38", decimal_38),
+        ("decimal_76_nullable", decimal_76),
+    ])?
+    .into_array();
+    let dtype = st.dtype().clone();
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.clone().to_array_stream())
+        .await?;
+    let written = buf.len();
+
+    let chunks: Vec<_> = SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?
+        .try_collect()
+        .await?;
+    let read = ChunkedArray::try_new(chunks, dtype)?.into_array();
+
+    let mut ctx = SESSION.create_execution_ctx();
+    assert_eq!(read.len(), N);
+    assert_arrays_eq!(st, read, &mut ctx);
+
+    let uncompressed = N * UNCOMPRESSED_BYTES_PER_ROW;
+    assert!(
+        written * 4 < uncompressed,
+        "expected at least 4x compression, wrote {written} bytes for {uncompressed} bytes of \
+         decimal values"
+    );
+    Ok(())
 }
 
 #[tokio::test]
