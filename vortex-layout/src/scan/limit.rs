@@ -24,10 +24,14 @@ impl RowLimit {
 
     /// Reserve rows selected by `mask` and retain only the earliest granted rows in that mask.
     pub(crate) fn limit(&self, mask: Mask) -> Mask {
-        let requested = u64::try_from(mask.true_count()).unwrap_or(u64::MAX);
-        let granted = self.reserve(requested);
-        let granted = usize::try_from(granted).unwrap_or(usize::MAX);
+        let granted = self.take(mask.true_count());
         mask.limit(granted)
+    }
+
+    /// Reserve up to `rows` rows, returning how many the remaining budget granted.
+    pub(crate) fn take(&self, rows: usize) -> usize {
+        let requested = u64::try_from(rows).unwrap_or(u64::MAX);
+        usize::try_from(self.reserve(requested)).unwrap_or(usize::MAX)
     }
 
     pub(crate) fn is_exhausted(&self) -> bool {

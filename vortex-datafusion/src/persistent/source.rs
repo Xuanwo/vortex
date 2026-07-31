@@ -28,7 +28,6 @@ use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
-use vortex::error::VortexExpect;
 use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::layout::LayoutReader;
 use vortex::metrics::DefaultMetricsRegistry;
@@ -190,8 +189,6 @@ pub struct VortexSource {
     /// Subset of predicates that can be pushed down into Vortex scan operations.
     /// These are expressions that Vortex can efficiently evaluate during scanning.
     pub(crate) vortex_predicate: Option<PhysicalExprRef>,
-    /// Desired row count for record batches returned from the scan.
-    pub(crate) batch_size: Option<usize>,
     /// DataFusion-native metrics exposed through `DataSourceExec`.
     df_metrics: ExecutionPlanMetricsSet,
     /// Shared layout readers, the source only lives as long as one scan.
@@ -230,7 +227,6 @@ impl VortexSource {
             projection,
             full_predicate: None,
             vortex_predicate: None,
-            batch_size: None,
             df_metrics: Default::default(),
             layout_readers: Arc::new(DashMap::default()),
             natural_splits: Arc::new(DashMap::default()),
@@ -337,10 +333,6 @@ impl VortexSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> DFResult<VortexOpener> {
-        let batch_size = self
-            .batch_size
-            .vortex_expect("batch_size must be supplied to VortexSource");
-
         let expr_adapter_factory = base_config
             .expr_adapter_factory
             .clone()
@@ -360,7 +352,6 @@ impl VortexSource {
             file_pruning_predicate: self.full_predicate.clone(),
             expr_adapter_factory,
             table_schema: self.table_schema.clone(),
-            batch_size,
             limit: base_config.limit.map(|l| l as u64),
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             df_metrics: self.df_metrics.clone(),
@@ -391,10 +382,9 @@ impl FileSource for VortexSource {
         )?))
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut source = self.clone();
-        source.batch_size = Some(batch_size);
-        Arc::new(source)
+    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
+        // DataSourceExec applies BatchSplitStream after the FileSource stream.
+        Arc::new(self.clone())
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
@@ -675,10 +665,6 @@ mod tests {
             VortexSession::default(),
         )
         .with_expression_convertor(Arc::clone(&expression_convertor));
-        let source = source.with_batch_size(100);
-        let source = source
-            .downcast_ref::<VortexSource>()
-            .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?;
 
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
@@ -696,7 +682,6 @@ mod tests {
             &opener.expression_convertor,
             &expression_convertor
         ));
-        assert_eq!(opener.batch_size, 100);
         Ok(())
     }
 

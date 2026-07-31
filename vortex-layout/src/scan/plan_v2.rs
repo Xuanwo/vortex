@@ -8,14 +8,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bit_vec::BitVec;
-use futures::FutureExt;
-use futures::future::BoxFuture;
 use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::replace;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -26,7 +23,6 @@ use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 use crate::scan::limit::RowLimit;
 use crate::scan::plan::TaskFuture;
-use crate::scan::plan::TaskResult;
 
 pub(crate) struct PlanV2 {
     projection: ScanPlanRef,
@@ -242,104 +238,22 @@ pub(crate) fn split_exec(
             Err(err) if limited => return Ok(TaskFuture::terminal(err)),
             Err(err) => return Err(err),
         };
-        return Ok(TaskFuture::new(async move {
-            match projection.await {
-                Ok(array) => TaskResult::Array(Some(array)),
-                Err(err) if limited => TaskResult::Terminal(err),
-                Err(err) => TaskResult::Recoverable(err),
-            }
-        }));
+        return Ok(TaskFuture::projection(projection, limited));
     };
+
+    if row_limit.is_some() {
+        // `ScanBuilder::prepare` falls back to the V1 plan for filtered limited scans, so mask
+        // level limit pushdown is never reached here.
+        vortex_bail!("plan v2 does not support a limit on a filtered scan");
+    }
 
     validate_predicates(&ctx, filter)?;
     let filter_mask = build_filter_mask(&ctx, filter, &row_range, row_mask);
 
-    let Some(row_limit) = row_limit else {
-        let projection = ctx
-            .projection
-            .projection_evaluation(&row_range, filter_mask.clone())?;
-        return Ok(TaskFuture::new(async move {
-            let mask = match filter_mask.await {
-                Ok(mask) => mask,
-                Err(err) => return TaskResult::Recoverable(err),
-            };
-            if mask.all_false() {
-                return TaskResult::Array(None);
-            }
-
-            match projection.await {
-                Ok(array) => TaskResult::Array(Some(array)),
-                Err(err) => TaskResult::Recoverable(err),
-            }
-        }));
-    };
-
-    let array_fut = async move {
-        let mask = match filter_mask.await {
-            Ok(mask) => mask,
-            Err(err) => return TaskResult::Recoverable(err),
-        };
-        let mask = row_limit.limit(mask);
-        if mask.all_false() {
-            return TaskResult::Array(None);
-        }
-
-        let projection = match ctx
-            .projection
-            .projection_evaluation(&row_range, MaskFuture::ready(mask))
-        {
-            Ok(projection) => projection,
-            Err(err) => return TaskResult::Terminal(err),
-        };
-        match projection.await {
-            Ok(array) => TaskResult::Array(Some(array)),
-            Err(err) => TaskResult::Terminal(err),
-        }
-    };
-
-    Ok(TaskFuture::new(array_fut))
-}
-
-pub(crate) fn filter_split(
-    ctx: Arc<TaskContext>,
-    read_mask: RowMask,
-) -> BoxFuture<'static, VortexResult<(Range<u64>, Mask)>> {
-    let row_range = read_mask.row_range();
-    let row_mask = read_mask.mask().clone();
-    let filter = ctx
-        .filter
-        .as_ref()
-        .vortex_expect("filter_split requires a filtered scan");
-    if let Err(err) = validate_predicates(&ctx, filter) {
-        return async move { Err(err) }.boxed();
-    }
-    let filter_mask = build_filter_mask(&ctx, filter, &row_range, row_mask);
-
-    async move {
-        let mask = filter_mask.await?;
-        Ok((row_range, mask))
-    }
-    .boxed()
-}
-
-pub(crate) fn project_split(
-    ctx: Arc<TaskContext>,
-    row_range: Range<u64>,
-    mask: Mask,
-) -> TaskFuture {
-    TaskFuture::new(async move {
-        let projection = match ctx
-            .projection
-            .projection_evaluation(&row_range, MaskFuture::ready(mask))
-        {
-            Ok(projection) => projection,
-            Err(err) => return TaskResult::Terminal(err),
-        };
-        match projection.await {
-            Ok(array) => TaskResult::Array(Some(array)),
-            Err(err) => TaskResult::Terminal(err),
-        }
-    })
+    let projection = ctx
+        .projection
+        .projection_evaluation(&row_range, filter_mask.clone())?;
+    Ok(TaskFuture::filtered_projection(filter_mask, projection))
 }
 
 fn validate_predicates(ctx: &TaskContext, filter: &FilterExpr) -> VortexResult<()> {

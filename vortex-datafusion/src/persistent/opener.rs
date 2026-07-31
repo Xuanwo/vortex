@@ -86,8 +86,6 @@ pub(crate) struct VortexOpener {
     /// This is the table's schema without partition columns. It may contain fields which do
     /// not exist in the file, and are supplied by the `schema_adapter_factory`.
     pub table_schema: TableSchema,
-    /// Desired row count for record batches returned from the scan.
-    pub batch_size: usize,
     /// If provided, the scan will not return more than this many rows.
     pub limit: Option<u64>,
     /// A metrics object for tracking performance of the scan.
@@ -139,7 +137,6 @@ impl FileOpener for VortexOpener {
         let file_metadata_cache = self.file_metadata_cache.clone();
 
         let unified_file_schema = Arc::clone(self.table_schema.file_schema());
-        let batch_size = self.batch_size;
         let limit = self.limit;
         let layout_readers = Arc::clone(&self.layout_readers);
         let natural_splits = Arc::clone(&self.natural_splits);
@@ -471,21 +468,6 @@ impl FileOpener for VortexOpener {
                     )
                     .map_err(Into::into)
                 })
-                // Natural chunks may exceed the requested batch size; slice the already
-                // converted batch, which is zero-copy in Arrow.
-                .map_ok(move |batch| {
-                    let rows = batch.num_rows();
-                    let slices: Vec<DFResult<RecordBatch>> = if rows > batch_size {
-                        (0..rows)
-                            .step_by(batch_size)
-                            .map(|start| Ok(batch.slice(start, batch_size.min(rows - start))))
-                            .collect()
-                    } else {
-                        vec![Ok(batch)]
-                    };
-                    stream::iter(slices)
-                })
-                .try_flatten()
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {
@@ -842,7 +824,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema,
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),
@@ -905,38 +886,6 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_open_splits_vortex_chunks_by_batch_size() -> anyhow::Result<()> {
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let file_path = "batched/file.vortex";
-        let batch = record_batch!((
-            "a",
-            Int32,
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
-        ))?;
-        let data_size =
-            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
-        let file = PartitionedFile::new(file_path.to_string(), data_size);
-
-        let mut opener = make_opener(
-            object_store,
-            TableSchema::from_file_schema(batch.schema()),
-            None,
-        );
-        opener.batch_size = 2;
-
-        let batches = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
-        assert_eq!(
-            batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .collect::<Vec<_>>(),
-            [2, 2, 1]
-        );
 
         Ok(())
     }
@@ -1248,7 +1197,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema: table_schema.clone(),
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),
@@ -1336,7 +1284,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema: TableSchema::from_file_schema(Arc::clone(&table_schema)),
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),
@@ -1494,7 +1441,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema: table_schema.clone(),
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),
@@ -1555,7 +1501,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema: TableSchema::from_file_schema(schema),
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),
@@ -1765,7 +1710,6 @@ mod tests {
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             table_schema,
-            batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             df_metrics: ExecutionPlanMetricsSet::new(),

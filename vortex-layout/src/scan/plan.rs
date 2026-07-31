@@ -18,7 +18,6 @@ use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::expr::Expression;
 use vortex_error::VortexError;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
@@ -73,7 +72,11 @@ impl TaskFuture {
         Self::ready(TaskResult::Terminal(error))
     }
 
-    fn projection(projection: ArrayFuture, terminal: bool) -> Self {
+    /// Project a split whose mask needed no filtering.
+    ///
+    /// `terminal` marks that the mask already reserved rows against a limit, so a failure cannot
+    /// be reported without ending the scan.
+    pub(crate) fn projection(projection: ArrayFuture, terminal: bool) -> Self {
         Self::new(async move {
             match projection.await {
                 Ok(array) => TaskResult::Array(Some(array)),
@@ -83,7 +86,11 @@ impl TaskFuture {
         })
     }
 
-    fn filtered_projection(filter_mask: MaskFuture, projection: ArrayFuture) -> Self {
+    /// Project the rows a filter matched, skipping projection entirely for an empty split.
+    ///
+    /// The projection is constructed by the caller, before the filter has run, so that the reader
+    /// can prefetch its I/O.
+    pub(crate) fn filtered_projection(filter_mask: MaskFuture, projection: ArrayFuture) -> Self {
         Self::new(async move {
             let mask = match filter_mask.await {
                 Ok(mask) => mask,
@@ -100,6 +107,11 @@ impl TaskFuture {
         })
     }
 
+    /// Filter, reserve the matching rows against `row_limit`, then project only what was granted.
+    ///
+    /// Projection work is constructed after reservation, so rows the limit cannot grant are never
+    /// decoded. Once rows have been reserved they cannot be released back to a concurrent limit,
+    /// so any projection failure is terminal.
     fn limited_filtered_projection(
         ctx: Arc<TaskContext>,
         row_range: Range<u64>,
@@ -111,41 +123,25 @@ impl TaskFuture {
                 Ok(mask) => mask,
                 Err(error) => return TaskResult::Recoverable(error),
             };
-            // A filter error above returns before reserving any rows. Once filtering has
-            // succeeded, reserve only the matching rows and defer projection construction until
-            // this task is polled by the runtime.
+            // A filter error above returns before reserving any rows.
             let mask = row_limit.limit(mask);
             if mask.all_false() {
                 return TaskResult::Array(None);
             }
 
-            run_deferred_projection(ctx, row_range, mask).await
+            let projection = match ctx.reader.projection_evaluation(
+                &row_range,
+                &ctx.projection,
+                MaskFuture::ready(mask),
+            ) {
+                Ok(projection) => projection,
+                Err(error) => return TaskResult::Terminal(error),
+            };
+            match projection.await {
+                Ok(array) => TaskResult::Array(Some(array)),
+                Err(error) => TaskResult::Terminal(error),
+            }
         })
-    }
-
-    fn deferred_projection(ctx: Arc<TaskContext>, row_range: Range<u64>, mask: Mask) -> Self {
-        Self::new(run_deferred_projection(ctx, row_range, mask))
-    }
-}
-
-/// Construct and run the projection for an already-reserved mask, classifying any failure as
-/// terminal (rows have been reserved and cannot be released back to a concurrent limit).
-async fn run_deferred_projection(
-    ctx: Arc<TaskContext>,
-    row_range: Range<u64>,
-    mask: Mask,
-) -> TaskResult {
-    let projection =
-        match ctx
-            .reader
-            .projection_evaluation(&row_range, &ctx.projection, MaskFuture::ready(mask))
-        {
-            Ok(projection) => projection,
-            Err(error) => return TaskResult::Terminal(error),
-        };
-    match projection.await {
-        Ok(array) => TaskResult::Array(Some(array)),
-        Err(error) => TaskResult::Terminal(error),
     }
 }
 
@@ -258,44 +254,6 @@ pub(crate) fn split_exec(
     ))
 }
 
-/// Evaluate the filter for a split and return the matching mask together with its row range.
-///
-/// This is the first stage of the ordered filtered-limit pipeline. It performs the same pruning
-/// and filter I/O as [`split_exec`] (registered eagerly, outside the returned future, so the IO
-/// system can prefetch while earlier splits are still reserving), but it neither reserves against
-/// the limit nor projects. The caller reserves the returned mask in split order and then projects
-/// it via [`project_split`], which keeps ordered `LIMIT` semantics without serializing I/O.
-pub(crate) fn filter_split(
-    ctx: Arc<TaskContext>,
-    read_mask: RowMask,
-) -> BoxFuture<'static, VortexResult<(Range<u64>, Mask)>> {
-    let row_range = read_mask.row_range();
-    let row_mask = read_mask.mask().clone();
-    let filter = ctx
-        .filter
-        .as_ref()
-        .vortex_expect("filter_split requires a filtered scan");
-    let filter_mask = build_filter_mask(&ctx.reader, filter, &row_range, row_mask);
-
-    async move {
-        let mask = filter_mask.await?;
-        Ok((row_range, mask))
-    }
-    .boxed()
-}
-
-/// Project an already-reserved, non-empty mask for a split.
-///
-/// This is the second stage of the ordered filtered-limit pipeline, run after the caller has
-/// reserved rows against the limit in split order (see [`filter_split`]).
-pub(crate) fn project_split(
-    ctx: Arc<TaskContext>,
-    row_range: Range<u64>,
-    mask: Mask,
-) -> TaskFuture {
-    TaskFuture::deferred_projection(ctx, row_range, mask)
-}
-
 /// Build the filtered mask for a split.
 ///
 /// The pruning and filter evaluations are constructed OUTSIDE the returned future on purpose:
@@ -377,177 +335,4 @@ pub(crate) struct TaskContext {
     filter: Option<Arc<FilterExpr>>,
     reader: LayoutReaderRef,
     projection: Expression,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ops::Range;
-    use std::sync::Arc;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
-
-    use parking_lot::Mutex;
-    use vortex_array::IntoArray;
-    use vortex_array::MaskFuture;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::DType;
-    use vortex_array::dtype::FieldMask;
-    use vortex_array::dtype::Nullability;
-    use vortex_array::dtype::PType;
-    use vortex_array::expr::Expression;
-    use vortex_array::expr::root;
-    use vortex_error::VortexResult;
-    use vortex_error::vortex_err;
-    use vortex_mask::Mask;
-
-    use super::TaskContext;
-    use super::TaskResult;
-    use super::project_split;
-    use crate::ArrayFuture;
-    use crate::LayoutReader;
-    use crate::RowSplits;
-    use crate::SplitRange;
-
-    struct BlockingProjectionReader {
-        name: Arc<str>,
-        dtype: DType,
-        started: mpsc::Sender<()>,
-        gate: Arc<Mutex<()>>,
-    }
-
-    impl LayoutReader for BlockingProjectionReader {
-        fn name(&self) -> &Arc<str> {
-            &self.name
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn dtype(&self) -> &DType {
-            &self.dtype
-        }
-
-        fn row_count(&self) -> u64 {
-            1
-        }
-
-        fn register_splits(
-            &self,
-            _field_mask: &[FieldMask],
-            split_range: &SplitRange,
-            splits: &mut RowSplits,
-        ) -> VortexResult<()> {
-            splits.push(split_range.root_row_range().end);
-            Ok(())
-        }
-
-        fn pruning_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: Mask,
-        ) -> VortexResult<MaskFuture> {
-            Ok(MaskFuture::ready(mask))
-        }
-
-        fn filter_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<MaskFuture> {
-            Ok(mask)
-        }
-
-        fn projection_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            _mask: MaskFuture,
-        ) -> VortexResult<ArrayFuture> {
-            self.started
-                .send(())
-                .map_err(|_| vortex_err!("test projection-start receiver dropped"))?;
-            let _guard = self.gate.lock();
-            let array = PrimitiveArray::from_iter([0_i32]).into_array();
-            Ok(Box::pin(async move { Ok(array) }))
-        }
-    }
-
-    #[test]
-    fn project_split_defers_projection_construction_until_task_poll() -> VortexResult<()> {
-        let gate = Arc::new(Mutex::new(()));
-        let guard = gate.lock();
-        let (started_send, started_recv) = mpsc::channel();
-        let reader: Arc<dyn LayoutReader> = Arc::new(BlockingProjectionReader {
-            name: Arc::from("blocking-projection"),
-            dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
-            started: started_send,
-            gate: Arc::clone(&gate),
-        });
-        let ctx = Arc::new(TaskContext {
-            filter: None,
-            reader,
-            projection: root(),
-        });
-
-        let (task_send, task_recv) = mpsc::channel();
-        let construction = thread::spawn(move || {
-            let task = project_split(ctx, 0..1, Mask::new_true(1));
-            drop(task_send.send(task));
-        });
-
-        let task = match task_recv.recv_timeout(Duration::from_secs(1)) {
-            Ok(task) => task,
-            Err(_) => {
-                drop(guard);
-                drop(construction.join());
-                return Err(vortex_err!(
-                    "constructing a projection task blocked before it was polled"
-                ));
-            }
-        };
-        if construction.join().is_err() {
-            return Err(vortex_err!("projection-task construction panicked"));
-        }
-        match started_recv.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            Ok(()) => {
-                return Err(vortex_err!(
-                    "projection construction started before the task was polled"
-                ));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(vortex_err!(
-                    "projection-start sender disconnected unexpectedly"
-                ));
-            }
-        }
-
-        let (result_send, result_recv) = mpsc::channel();
-        let execution = thread::spawn(move || {
-            let result = futures::executor::block_on(task);
-            drop(result_send.send(result));
-        });
-
-        if started_recv.recv_timeout(Duration::from_secs(1)).is_err() {
-            drop(guard);
-            drop(execution.join());
-            return Err(vortex_err!(
-                "projection construction did not start when polled"
-            ));
-        }
-        drop(guard);
-        let result = result_recv
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| vortex_err!("projection task did not complete"))?;
-        if execution.join().is_err() {
-            return Err(vortex_err!("projection task panicked"));
-        }
-
-        assert!(matches!(result, TaskResult::Array(Some(_))));
-        Ok(())
-    }
 }

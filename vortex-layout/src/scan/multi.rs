@@ -89,7 +89,6 @@ pub struct MultiLayoutDataSource {
     concurrency: usize,
 }
 
-#[derive(Clone)]
 pub enum MultiLayoutChild {
     Opened {
         reader: LayoutReaderRef,
@@ -289,19 +288,6 @@ impl DataSource for MultiLayoutDataSource {
     }
 
     async fn scan(&self, scan_request: ScanRequest) -> VortexResult<DataSourceScanRef> {
-        let dtype = scan_request.projection.return_dtype(&self.dtype)?;
-
-        if scan_request.ordered && scan_request.limit.is_some() {
-            // Ordered global limits must consume complete files in order. A single composite
-            // partition owns a local mask-level limit and scans each selected file sequentially.
-            return Ok(Box::new(OrderedMultiLayoutScan {
-                session: self.session.clone(),
-                dtype,
-                request: scan_request,
-                children: self.children.iter().cloned().enumerate().collect(),
-            }));
-        }
-
         let mut ready = VecDeque::new();
         let mut deferred = VecDeque::new();
 
@@ -314,8 +300,14 @@ impl DataSource for MultiLayoutDataSource {
             }
         }
 
-        // Only unordered scans share a completion-order limit across external partitions.
-        let row_limit = scan_request.limit.map(RowLimit::new);
+        let dtype = scan_request.projection.return_dtype(&self.dtype)?;
+
+        // Only unordered scans share a limit across external partitions: reservation order is
+        // completion order, which an ordered scan cannot accept. Ordered partitions each apply the
+        // limit locally and the engine trims the concatenated result.
+        let row_limit = (!scan_request.ordered)
+            .then(|| scan_request.limit.map(RowLimit::new))
+            .flatten();
 
         Ok(Box::new(MultiLayoutScan {
             session: self.session.clone(),
@@ -432,126 +424,6 @@ impl DataSourceScan for MultiLayoutScan {
     }
 }
 
-/// An ordered scan with a global limit. It produces one partition so a later file cannot reserve
-/// rows before every earlier selected file has been accounted for.
-struct OrderedMultiLayoutScan {
-    session: VortexSession,
-    dtype: DType,
-    request: ScanRequest,
-    children: VecDeque<(usize, MultiLayoutChild)>,
-}
-
-impl DataSourceScan for OrderedMultiLayoutScan {
-    fn dtype(&self) -> &DType {
-        &self.dtype
-    }
-
-    fn partition_count(&self) -> Precision<usize> {
-        Precision::exact(1usize)
-    }
-
-    fn partitions(self: Box<Self>) -> PartitionStream {
-        let Self {
-            session,
-            dtype,
-            request,
-            children,
-        } = *self;
-
-        stream::once(async move {
-            Ok(Box::new(OrderedMultiLayoutPartition {
-                session,
-                dtype,
-                request,
-                children,
-            }) as PartitionRef)
-        })
-        .boxed()
-    }
-}
-
-/// A composite partition that opens and scans selected readers one at a time.
-struct OrderedMultiLayoutPartition {
-    session: VortexSession,
-    dtype: DType,
-    request: ScanRequest,
-    children: VecDeque<(usize, MultiLayoutChild)>,
-}
-
-impl Partition for OrderedMultiLayoutPartition {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn index(&self) -> usize {
-        0
-    }
-
-    fn row_count(&self) -> Precision<u64> {
-        Precision::inexact(self.request.limit.unwrap_or_default())
-    }
-
-    fn byte_size(&self) -> Precision<u64> {
-        Precision::Absent
-    }
-
-    fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
-        let Self {
-            session,
-            dtype,
-            request,
-            children,
-        } = *self;
-        let Some(limit) = request.limit else {
-            vortex_bail!("ordered multi-layout partitions require a row limit");
-        };
-        let row_limit = RowLimit::new(limit);
-
-        let stream = async_stream::try_stream! {
-            for (index, child) in children {
-                if row_limit.is_exhausted() {
-                    break;
-                }
-                if !partition_is_selected(index, &request) {
-                    continue;
-                }
-
-                let reader = match child {
-                    MultiLayoutChild::Opened { reader, .. } => reader,
-                    MultiLayoutChild::Deferred { factory, .. } => {
-                        let Some(reader) = factory
-                            .open()
-                            .instrument(tracing::info_span!("LayoutReaderFactory::open"))
-                            .await?
-                        else {
-                            continue;
-                        };
-                        reader
-                    }
-                };
-
-                let mut partitions = reader_partition(
-                    index,
-                    reader,
-                    session.clone(),
-                    request.clone(),
-                    Some(row_limit.clone()),
-                );
-                while let Some(partition) = partitions.next().await {
-                    let mut chunks = partition?.execute()?;
-                    while let Some(chunk) = chunks.next().await {
-                        yield chunk?;
-                    }
-                }
-            }
-        };
-
-        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
-            dtype, stream,
-        )))
-    }
-}
-
 /// Generates a partition stream for a single layout reader.
 ///
 /// Checks file-level pruning first (via `pruning_evaluation`). If the filter proves no rows
@@ -567,9 +439,25 @@ fn reader_partition(
     let row_count = reader.row_count();
     let row_range = request.row_range.clone().unwrap_or(0..row_count);
 
-    if !partition_is_selected(partition_idx, &request) {
+    let partition_idx_u64: u64 = partition_idx as u64;
+    if let Some(range) = &request.partition_range
+        && !range.contains(&partition_idx_u64)
+    {
         return stream::empty().boxed();
-    }
+    };
+    match &request.partition_selection {
+        Selection::IncludeByIndex(buffer) => {
+            if buffer.as_slice().binary_search(&partition_idx_u64).is_err() {
+                return stream::empty().boxed();
+            }
+        }
+        Selection::ExcludeByIndex(buffer) => {
+            if buffer.as_slice().binary_search(&partition_idx_u64).is_ok() {
+                return stream::empty().boxed();
+            }
+        }
+        _ => {}
+    };
 
     // Check file-level pruning: if the filter can be proven false for the entire row range
     // using file-level statistics, skip this reader entirely.
@@ -597,25 +485,6 @@ fn reader_partition(
         }) as PartitionRef)
     })
     .boxed()
-}
-
-fn partition_is_selected(partition_idx: usize, request: &ScanRequest) -> bool {
-    let partition_idx = partition_idx as u64;
-    if let Some(range) = &request.partition_range
-        && !range.contains(&partition_idx)
-    {
-        return false;
-    }
-
-    match &request.partition_selection {
-        Selection::IncludeByIndex(buffer) => {
-            buffer.as_slice().binary_search(&partition_idx).is_ok()
-        }
-        Selection::ExcludeByIndex(buffer) => {
-            buffer.as_slice().binary_search(&partition_idx).is_err()
-        }
-        _ => true,
-    }
 }
 
 /// A partition backed by a single [`LayoutReaderRef`] and a row range.
@@ -686,34 +555,22 @@ impl Partition for MultiLayoutPartition {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Range;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use futures::TryStreamExt;
     use rstest::rstest;
-    use vortex_array::IntoArray;
-    use vortex_array::MaskFuture;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::FieldMask;
     use vortex_array::dtype::Nullability;
-    use vortex_array::dtype::PType;
-    use vortex_array::expr::Expression;
     use vortex_array::expr::root;
     use vortex_error::VortexResult;
     use vortex_io::runtime::BlockingRuntime;
     use vortex_io::runtime::single::SingleThreadRuntime;
-    use vortex_mask::Mask;
     use vortex_scan::DataSource;
     use vortex_scan::ScanRequest;
 
     use super::*;
-    use crate::ArrayFuture;
-    use crate::LayoutReader;
-    use crate::RowSplits;
-    use crate::SplitRange;
+    use crate::scan::test::TestLayoutReader;
+    use crate::scan::test::collect_scan_values;
     use crate::scan::test::new_session;
     use crate::scan::test::session_with_handle;
 
@@ -748,89 +605,6 @@ mod tests {
         assert_eq!(deferred_source(sizes).byte_size(), expected);
     }
 
-    #[derive(Debug)]
-    struct TestLayoutReader {
-        name: Arc<str>,
-        dtype: DType,
-        base: i32,
-        row_count: u64,
-    }
-
-    impl TestLayoutReader {
-        fn new(name: &'static str, base: i32, row_count: u64) -> Self {
-            Self {
-                name: Arc::from(name),
-                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
-                base,
-                row_count,
-            }
-        }
-    }
-
-    impl LayoutReader for TestLayoutReader {
-        fn name(&self) -> &Arc<str> {
-            &self.name
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn dtype(&self) -> &DType {
-            &self.dtype
-        }
-
-        fn row_count(&self) -> u64 {
-            self.row_count
-        }
-
-        fn register_splits(
-            &self,
-            _field_mask: &[FieldMask],
-            split_range: &SplitRange,
-            splits: &mut RowSplits,
-        ) -> VortexResult<()> {
-            splits.push(split_range.root_row_range().end);
-            Ok(())
-        }
-
-        fn pruning_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: Mask,
-        ) -> VortexResult<MaskFuture> {
-            Ok(MaskFuture::ready(mask))
-        }
-
-        fn filter_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<MaskFuture> {
-            Ok(mask)
-        }
-
-        fn projection_evaluation(
-            &self,
-            row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<ArrayFuture> {
-            let row_range = row_range.clone();
-            let base = self.base;
-
-            Ok(Box::pin(async move {
-                let start = i32::try_from(row_range.start)?;
-                let end = i32::try_from(row_range.end)?;
-                PrimitiveArray::from_iter((start..end).map(|value| base + value))
-                    .into_array()
-                    .filter(mask.await?)
-            }))
-        }
-    }
-
     struct StaticReaderFactory {
         reader: LayoutReaderRef,
     }
@@ -842,12 +616,14 @@ mod tests {
         }
     }
 
+    /// An unordered limit is shared by every file of the scan, so the files together return no
+    /// more than the limit even though each one is scanned independently.
     #[test]
-    fn ordered_limit_scans_multiple_readers_sequentially() -> VortexResult<()> {
+    fn unordered_limit_is_shared_across_readers() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
         let session = session_with_handle(runtime.handle());
-        let first: LayoutReaderRef = Arc::new(TestLayoutReader::new("first", 0, 2));
-        let second: LayoutReaderRef = Arc::new(TestLayoutReader::new("second", 10, 2));
+        let first: LayoutReaderRef = Arc::new(TestLayoutReader::new(2));
+        let second: LayoutReaderRef = Arc::new(TestLayoutReader::new(2).with_base(10));
         let source = MultiLayoutDataSource::new_with_first(
             first,
             vec![Arc::new(StaticReaderFactory { reader: second })],
@@ -858,22 +634,21 @@ mod tests {
         let scan = runtime.block_on(source.scan(ScanRequest {
             filter: Some(root()),
             limit: Some(3),
-            ordered: true,
+            ordered: false,
             ..Default::default()
         }))?;
         let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions.len(), 2);
 
-        let mut ctx = array_session().create_execution_ctx();
         let mut values = Vec::new();
         for partition in partitions {
-            for chunk in runtime.block_on_stream(partition.execute()?) {
-                let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
-                values.extend(primitive.into_buffer::<i32>());
-            }
+            values.extend(collect_scan_values(
+                runtime.block_on_stream(partition.execute()?),
+            )?);
         }
 
-        assert_eq!(values, [0, 1, 10]);
+        // Three of the four rows, whichever partition reserved them first.
+        assert_eq!(values.len(), 3);
         Ok(())
     }
 }

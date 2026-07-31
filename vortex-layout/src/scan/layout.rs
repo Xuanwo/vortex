@@ -158,18 +158,12 @@ impl DataSource for LayoutReaderDataSource {
             }
         }
 
-        // An ordered limit must see earlier filtered rows before later external partitions are
-        // allowed to reserve any budget. Emit one partition for that path; its inner scan keeps
-        // the limit at mask level. Unordered partitions share a completion-order budget instead.
-        let ordered_limit = scan_request.ordered && scan_request.limit.is_some();
+        // Only unordered scans share a limit across external partitions: reservation order is
+        // completion order, which an ordered scan cannot accept. Ordered partitions each apply
+        // the limit locally and the engine trims the concatenated result.
         let row_limit = (!scan_request.ordered)
             .then(|| scan_request.limit.map(RowLimit::new))
             .flatten();
-        let split_size = if ordered_limit {
-            row_range.end - row_range.start
-        } else {
-            self.split_max_row_count
-        };
 
         Ok(Box::new(LayoutReaderScan {
             reader: Arc::clone(&self.reader),
@@ -184,7 +178,7 @@ impl DataSource for LayoutReaderDataSource {
             metrics_registry: self.metrics_registry.clone(),
             next_row: row_range.start,
             end_row: row_range.end,
-            split_size,
+            split_size: self.split_max_row_count,
         }))
     }
 
@@ -250,12 +244,27 @@ impl Stream for LayoutReaderScan {
             .saturating_add(this.split_size)
             .min(this.end_row);
         let row_range = this.next_row..split_end;
+        let split_rows = split_end - this.next_row;
+
+        let split_limit = this.limit;
+        // Only decrement the remaining limit when there is no filter. With a filter,
+        // the actual output row count is unknown (could be anywhere from 0 to split_rows),
+        // so decrementing by split_rows would be too aggressive and could stop producing
+        // splits before the limit is reached. Instead, pass the full remaining limit to
+        // each split; a shared `row_limit` (unordered scans) caps the total, and otherwise
+        // the engine enforces the exact limit at the stream level.
+        if this.filter.is_none()
+            && let Some(ref mut limit) = this.limit
+        {
+            *limit = limit.saturating_sub(split_rows);
+        }
+
         let split = Box::new(LayoutReaderSplit {
             reader: Arc::clone(&this.reader),
             session: this.session.clone(),
             projection: this.projection.clone(),
             filter: this.filter.clone(),
-            limit: this.limit,
+            limit: split_limit,
             row_limit: this.row_limit.clone(),
             ordered: this.ordered,
             row_range,
@@ -405,273 +414,25 @@ impl Partition for Empty {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Range;
     use std::sync::Arc;
-    use std::task::Poll;
 
     use futures::StreamExt;
     use futures::TryStreamExt;
     use parking_lot::Mutex;
-    use vortex_array::IntoArray;
-    use vortex_array::MaskFuture;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::DType;
-    use vortex_array::dtype::FieldMask;
-    use vortex_array::dtype::Nullability;
-    use vortex_array::dtype::PType;
-    use vortex_array::expr::Expression;
     use vortex_array::expr::root;
     use vortex_error::VortexResult;
     use vortex_io::runtime::BlockingRuntime;
     use vortex_io::runtime::single::SingleThreadRuntime;
-    use vortex_mask::Mask;
     use vortex_scan::DataSource;
     use vortex_scan::ScanRequest;
 
     use super::LayoutReaderDataSource;
-    use crate::ArrayFuture;
-    use crate::LayoutReader;
-    use crate::RowSplits;
-    use crate::SplitRange;
+    use crate::scan::test::TestLayoutReader;
+    use crate::scan::test::collect_scan_values;
     use crate::scan::test::session_with_handle;
 
-    /// A configurable [`LayoutReader`] test double. Splits come from the data source's
-    /// `with_split_max_row_count`; the filter passes rows through (optionally delaying the first
-    /// split to exercise concurrent prefetch), and projection masks/ranges plus evaluated filter
-    /// ranges are recorded for assertions.
-    #[derive(Debug)]
-    struct TestLayoutReader {
-        name: Arc<str>,
-        dtype: DType,
-        row_count: u64,
-        split_size: Option<u64>,
-        delay_first_filter: bool,
-        projection_masks: Option<Arc<Mutex<Vec<usize>>>>,
-        projection_ranges: Option<Arc<Mutex<Vec<Range<u64>>>>>,
-        filter_ranges: Arc<Mutex<Vec<Range<u64>>>>,
-    }
-
-    impl TestLayoutReader {
-        fn new(row_count: u64) -> Self {
-            Self {
-                name: Arc::from("test"),
-                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
-                row_count,
-                split_size: None,
-                delay_first_filter: false,
-                projection_masks: None,
-                projection_ranges: None,
-                filter_ranges: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn with_split_size(mut self, split_size: u64) -> Self {
-            self.split_size = Some(split_size);
-            self
-        }
-
-        fn with_projection_masks(mut self, projection_masks: Arc<Mutex<Vec<usize>>>) -> Self {
-            self.projection_masks = Some(projection_masks);
-            self
-        }
-
-        fn with_projection_ranges(
-            mut self,
-            projection_ranges: Arc<Mutex<Vec<Range<u64>>>>,
-        ) -> Self {
-            self.projection_ranges = Some(projection_ranges);
-            self
-        }
-
-        fn with_delayed_first_filter(mut self) -> Self {
-            self.delay_first_filter = true;
-            self
-        }
-
-        /// Row ranges whose filter was actually evaluated (recorded when the filter future runs,
-        /// not when it is merely scheduled).
-        fn filter_ranges(&self) -> Arc<Mutex<Vec<Range<u64>>>> {
-            Arc::clone(&self.filter_ranges)
-        }
-    }
-
-    impl LayoutReader for TestLayoutReader {
-        fn name(&self) -> &Arc<str> {
-            &self.name
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn dtype(&self) -> &DType {
-            &self.dtype
-        }
-
-        fn row_count(&self) -> u64 {
-            self.row_count
-        }
-
-        fn register_splits(
-            &self,
-            _field_mask: &[FieldMask],
-            split_range: &SplitRange,
-            splits: &mut RowSplits,
-        ) -> VortexResult<()> {
-            let row_range = split_range.row_range();
-            if let Some(size) = self.split_size {
-                let mut boundary = row_range.start + size;
-                while boundary < row_range.end {
-                    splits.push(split_range.row_offset() + boundary);
-                    boundary += size;
-                }
-            }
-            splits.push(split_range.root_row_range().end);
-            Ok(())
-        }
-
-        fn pruning_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: Mask,
-        ) -> VortexResult<MaskFuture> {
-            Ok(MaskFuture::ready(mask))
-        }
-
-        fn filter_evaluation(
-            &self,
-            row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<MaskFuture> {
-            self.filter_ranges.lock().push(row_range.clone());
-            if self.delay_first_filter && row_range.start == 0 {
-                let len = mask.len();
-                return Ok(MaskFuture::new(len, async move {
-                    let mut yielded = false;
-                    futures::future::poll_fn(move |cx| {
-                        if yielded {
-                            Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                    mask.await
-                }));
-            }
-            Ok(mask)
-        }
-
-        fn projection_evaluation(
-            &self,
-            row_range: &Range<u64>,
-            _expr: &Expression,
-            mask: MaskFuture,
-        ) -> VortexResult<ArrayFuture> {
-            let row_range = row_range.clone();
-            let projection_masks = self.projection_masks.clone();
-            let projection_ranges = self.projection_ranges.clone();
-
-            Ok(Box::pin(async move {
-                let mask = mask.await?;
-                if let Some(projection_masks) = projection_masks {
-                    projection_masks.lock().push(mask.true_count());
-                }
-                if let Some(projection_ranges) = projection_ranges {
-                    projection_ranges.lock().push(row_range.clone());
-                }
-                let start = i32::try_from(row_range.start)?;
-                let end = i32::try_from(row_range.end)?;
-                PrimitiveArray::from_iter(start..end)
-                    .into_array()
-                    .filter(mask)
-            }))
-        }
-    }
-
-    #[test]
-    fn filtered_limit_is_global_across_scan_partitions() -> VortexResult<()> {
-        let runtime = SingleThreadRuntime::default();
-        let session = session_with_handle(runtime.handle());
-        let source = LayoutReaderDataSource::new(Arc::new(TestLayoutReader::new(6)), session)
-            .with_split_max_row_count(2);
-
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            filter: Some(root()),
-            limit: Some(3),
-            ordered: true,
-            ..Default::default()
-        }))?;
-        let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
-
-        let mut ctx = array_session().create_execution_ctx();
-        let mut values = Vec::new();
-        for partition in partitions {
-            for chunk in runtime.block_on_stream(partition.execute()?) {
-                let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
-                values.extend(primitive.into_buffer::<i32>());
-            }
-        }
-
-        assert_eq!(values, [0, 1, 2]);
-        Ok(())
-    }
-
-    #[test]
-    fn ordered_filtered_limit_evaluates_later_split_filter_concurrently() -> VortexResult<()> {
-        let runtime = SingleThreadRuntime::default();
-        let session = session_with_handle(runtime.handle());
-        let projection_ranges = Arc::new(Mutex::new(Vec::new()));
-        let reader = TestLayoutReader::new(4)
-            .with_split_size(2)
-            .with_projection_ranges(Arc::clone(&projection_ranges))
-            .with_delayed_first_filter();
-        let filter_ranges = reader.filter_ranges();
-        let source =
-            LayoutReaderDataSource::new(Arc::new(reader), session).with_split_max_row_count(2);
-
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            filter: Some(root()),
-            limit: Some(1),
-            ordered: true,
-            ..Default::default()
-        }))?;
-        let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
-
-        let mut ctx = array_session().create_execution_ctx();
-        let mut values = Vec::new();
-        for partition in partitions {
-            for chunk in runtime.block_on_stream(partition.execute()?) {
-                let primitive = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
-                values.extend(primitive.into_buffer::<i32>());
-            }
-        }
-
-        // Ordered LIMIT is still exact: only the first split's earliest row is projected.
-        assert_eq!(values, [0]);
-        let projection_ranges = projection_ranges.lock();
-        assert_eq!(projection_ranges.len(), 1);
-        assert_eq!(projection_ranges[0], 0..2);
-        drop(projection_ranges);
-
-        // But the later split's filter still runs while the delayed first split reserves, so
-        // prefetch is not disabled (serializing to concurrency=1 would only ever filter 0..2).
-        let filter_ranges = filter_ranges.lock();
-        assert!(
-            filter_ranges.contains(&(0..2)) && filter_ranges.contains(&(2..4)),
-            "expected both splits' filters to be evaluated, got {filter_ranges:?}"
-        );
-        Ok(())
-    }
-
+    /// An unordered limit is shared by every partition of the scan, and is applied to each split's
+    /// mask, so the partitions together never project more rows than the limit can return.
     #[test]
     fn unordered_limit_never_projects_more_than_the_global_budget() -> VortexResult<()> {
         let runtime = SingleThreadRuntime::default();
@@ -692,25 +453,17 @@ mod tests {
             ..Default::default()
         }))?;
         let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
+        assert_eq!(partitions.len(), 6);
+
         let chunks = runtime.block_on(
             futures::stream::iter(partitions)
                 .map(|partition| partition.execute())
                 .try_flatten_unordered(Some(6))
                 .try_collect::<Vec<_>>(),
         )?;
+        let values = collect_scan_values(chunks.into_iter().map(Ok))?;
 
-        let mut ctx = array_session().create_execution_ctx();
-        let values = chunks
-            .into_iter()
-            .map(|chunk| {
-                chunk
-                    .execute::<PrimitiveArray>(&mut ctx)
-                    .map(|primitive| primitive.into_buffer::<i32>())
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-        let row_count = values.iter().map(|values| values.len()).sum::<usize>();
-
-        assert_eq!(row_count, 3);
+        assert_eq!(values.len(), 3);
         assert_eq!(projection_masks.lock().iter().sum::<usize>(), 3);
         Ok(())
     }

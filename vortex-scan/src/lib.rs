@@ -139,13 +139,14 @@ pub struct ScanRequest {
     /// Partition range to scan, which allows readers to skip unwanted partitions.
     pub partition_range: Option<Range<u64>>,
     /// Whether the scan should preserve row order. If false, the scan may produce rows in any
-    /// order, for example to enable parallel execution across partitions. An ordered global
-    /// limit intentionally serializes external partitions so the returned rows are the first
-    /// matching rows in scan order.
+    /// order, for example to enable parallel execution across partitions.
     pub ordered: bool,
-    /// Optional global limit on the number of rows returned by the scan. Limits are applied after
-    /// filtering and row selection, but implementations must trim the resulting selection mask
-    /// before projection so they do not decode rows that cannot be returned.
+    /// Optional limit on the number of rows returned, applied after filtering and row selection.
+    ///
+    /// For an unordered scan the limit is global: partitions share it, and each one trims its
+    /// selection mask before projection so that rows which cannot be returned are never decoded.
+    /// An ordered scan cannot share a budget whose reservation order is completion order, so each
+    /// partition applies the limit locally and the caller must trim the concatenated result.
     pub limit: Option<u64>,
 }
 

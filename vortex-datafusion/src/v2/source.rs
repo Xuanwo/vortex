@@ -97,19 +97,12 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
-use futures::stream::BoxStream;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
-use vortex::array::stream::SendableArrayStream;
 use vortex::dtype::DType;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
-use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
-use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::and as vx_and;
 use vortex::expr::get_item;
@@ -117,8 +110,6 @@ use vortex::expr::pack;
 use vortex::expr::root;
 use vortex::expr::stats::Precision;
 use vortex::expr::transform::replace;
-use vortex::io::runtime::Handle;
-use vortex::io::runtime::JoinOutcome;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::scan::ScanRequest;
@@ -411,7 +402,6 @@ impl DataSource for VortexDataSource {
         ));
         let session = self.session.clone();
         let num_partitions = self.num_partitions;
-        let ordered = self.ordered;
 
         // Pre-build the leftover projector (if any) so we can apply it after batch conversion.
         let leftover_projector = self
@@ -428,18 +418,17 @@ impl DataSource for VortexDataSource {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Each split.execute() returns a lazy stream whose early polls do preparation
-            // work (expression resolution, layout traversal, first I/O spawns). Both ordering
-            // modes flatten with cross-partition I/O look-ahead; the ordered path additionally
-            // preserves partition order so an ordered global limit cannot observe later rows first.
+            // work (expression resolution, layout traversal, first I/O spawns). We use
+            // try_flatten_unordered to poll multiple split streams concurrently so that
+            // the next split is already warm when the current one finishes.
             let scan_streams = scan.partitions().map(|split_result| {
                 let split = split_result?;
                 split.execute()
             });
 
             let handle = session.handle();
-            let chunks =
-                flatten_scan_streams(scan_streams, ordered, num_partitions * 2, handle.clone());
-            let stream = chunks
+            let stream = scan_streams
+                .try_flatten_unordered(Some(num_partitions * 2))
                 .map(move |result| {
                     let session = session.clone();
                     let target_field = Arc::clone(&projected_target_field);
@@ -665,85 +654,6 @@ impl DataSource for VortexDataSource {
     }
 }
 
-fn flatten_scan_streams<S>(
-    scan_streams: S,
-    ordered: bool,
-    concurrency: usize,
-    handle: Handle,
-) -> BoxStream<'static, VortexResult<ArrayRef>>
-where
-    S: futures::Stream<Item = VortexResult<SendableArrayStream>> + Send + 'static,
-{
-    if !ordered {
-        return scan_streams
-            .try_flatten_unordered(Some(concurrency))
-            .boxed();
-    }
-
-    // Ordered output must preserve global row order, but later partitions should still warm up
-    // (start their I/O) while an earlier one is draining. `buffered` invokes this map while
-    // filling its window, so creating the channel and spawning the drain here starts each window
-    // member before `try_flatten` begins draining the first receiver. Each drain has a bounded
-    // channel for back-pressure. It can hold `CHUNK_BUFFER_CAPACITY` chunks plus one pending
-    // send, and at most `lookahead` drains are live at once.
-    const CHUNK_BUFFER_CAPACITY: usize = 2;
-    let lookahead = concurrency.max(1);
-    scan_streams
-        .map(move |stream_result| {
-            let handle = handle.clone();
-            let receiver = stream_result.map(|mut stream| {
-                let (tx, rx) = mpsc::channel(CHUNK_BUFFER_CAPACITY);
-                // Keep the drain task's handle (do not `detach` it) so that a panic inside the
-                // source stream is surfaced as a terminal error. A detached task's panic would be
-                // discarded; `tx` would drop, the receiver would end cleanly, and `try_flatten`
-                // would treat the truncated partition as a normal completion — silently returning
-                // incomplete results as success.
-                let drain = handle.spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = tx.closed() => break,
-                            item = stream.next() => {
-                                let Some(item) = item else {
-                                    break;
-                                };
-                                if tx.send(item).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-                // Once the receiver is drained, join the drain task and turn a panic into a
-                // terminal error item. A clean completion or a benign runtime abort ends the
-                // partition without appending an extra item.
-                let finalizer = futures::stream::once(async move {
-                    let mut drain = drain;
-                    match futures::future::poll_fn(|cx| drain.poll_join(cx)).await {
-                        JoinOutcome::Completed(()) | JoinOutcome::Aborted => None,
-                        JoinOutcome::Panicked(payload) => Some(Err(panic_to_vortex_err(payload))),
-                    }
-                })
-                .filter_map(|item| async move { item });
-                ReceiverStream::new(rx).chain(finalizer)
-            });
-            futures::future::ready(receiver)
-        })
-        .buffered(lookahead)
-        .try_flatten()
-        .boxed()
-}
-
-/// Convert a caught panic payload from an ordered drain task into a terminal [`VortexError`], so
-/// the scan surfaces the failure instead of silently truncating its output.
-fn panic_to_vortex_err(payload: Box<dyn std::any::Any + Send>) -> VortexError {
-    let message = payload
-        .downcast_ref::<&'static str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_string());
-    vortex_err!("ordered scan partition drain task panicked: {message}")
-}
-
 /// Convert a Vortex [`Option<Precision>`] to a DataFusion
 /// [`DataFusionPrecision`].
 ///
@@ -753,204 +663,5 @@ fn estimate_to_df_precision(est: &Precision<u64>) -> DFPrecision<usize> {
         Precision::Exact(v) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Inexact(v) => DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Absent => DFPrecision::Absent,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::Context;
-    use std::task::Poll;
-    use std::time::Duration;
-
-    use futures::Stream;
-    use futures::TryStreamExt;
-    use tokio::sync::Notify;
-    use tokio::sync::oneshot;
-    use vortex::array::ArrayRef;
-    use vortex::array::IntoArray;
-    use vortex::array::VortexSessionExecute;
-    use vortex::array::array_session;
-    use vortex::array::arrays::PrimitiveArray;
-    use vortex::array::stream::ArrayStreamAdapter;
-    use vortex::array::stream::ArrayStreamExt;
-    use vortex::dtype::DType;
-    use vortex::dtype::Nullability;
-    use vortex::dtype::PType;
-    use vortex::error::VortexError;
-    use vortex::error::VortexResult;
-    use vortex::error::vortex_err;
-    use vortex::io::runtime::tokio::TokioRuntime;
-
-    use super::flatten_scan_streams;
-
-    fn i32_stream(dtype: &DType, chunks: Vec<Vec<i32>>) -> super::SendableArrayStream {
-        let items = chunks
-            .into_iter()
-            .map(|values| Ok(PrimitiveArray::from_iter(values).into_array()))
-            .collect::<Vec<VortexResult<ArrayRef>>>();
-        ArrayStreamAdapter::new(dtype.clone(), futures::stream::iter(items)).boxed()
-    }
-
-    fn collect_i32(chunks: Vec<ArrayRef>) -> VortexResult<Vec<i32>> {
-        let mut ctx = array_session().create_execution_ctx();
-        let mut values = Vec::new();
-        for chunk in chunks {
-            let primitive = chunk.execute::<PrimitiveArray>(&mut ctx)?;
-            values.extend(primitive.into_buffer::<i32>());
-        }
-        Ok(values)
-    }
-
-    struct DropNotifier(Option<oneshot::Sender<()>>);
-
-    impl Drop for DropNotifier {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
-
-    struct DropNotifyingPendingStream {
-        started: Arc<Notify>,
-        _drop_notifier: DropNotifier,
-    }
-
-    impl Stream for DropNotifyingPendingStream {
-        type Item = VortexResult<ArrayRef>;
-
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            self.started.notify_one();
-            Poll::Pending
-        }
-    }
-
-    #[tokio::test]
-    async fn ordered_flatten_preserves_partition_order() -> VortexResult<()> {
-        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let first = i32_stream(&dtype, vec![vec![0, 1], vec![2]]);
-        let second = i32_stream(&dtype, vec![vec![10, 11]]);
-
-        let streams =
-            futures::stream::iter([Ok::<_, VortexError>(first), Ok::<_, VortexError>(second)]);
-        let flattened = flatten_scan_streams(streams, true, 4, TokioRuntime::current());
-        let chunks = flattened.try_collect::<Vec<_>>().await?;
-
-        assert_eq!(collect_i32(chunks)?, [0, 1, 2, 10, 11]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ordered_flatten_warms_later_partition_while_first_pending() -> VortexResult<()> {
-        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let first_started = Arc::new(Notify::new());
-        let first_started_for_stream = Arc::clone(&first_started);
-        let release_first = Arc::new(Notify::new());
-        let release_first_for_stream = Arc::clone(&release_first);
-        let first = ArrayStreamAdapter::new(
-            dtype.clone(),
-            futures::stream::once(async move {
-                first_started_for_stream.notify_one();
-                release_first_for_stream.notified().await;
-                Ok(PrimitiveArray::from_iter([0i32]).into_array())
-            }),
-        )
-        .boxed();
-
-        let first_started_for_second = Arc::clone(&first_started);
-        let release_first_for_second = Arc::clone(&release_first);
-        let second = ArrayStreamAdapter::new(
-            dtype,
-            futures::stream::once(async move {
-                first_started_for_second.notified().await;
-                release_first_for_second.notify_one();
-                Ok(PrimitiveArray::from_iter([100i32]).into_array())
-            }),
-        )
-        .boxed();
-
-        let streams =
-            futures::stream::iter([Ok::<_, VortexError>(first), Ok::<_, VortexError>(second)]);
-        let flattened = flatten_scan_streams(streams, true, 4, TokioRuntime::current());
-        let chunks =
-            tokio::time::timeout(Duration::from_secs(1), flattened.try_collect::<Vec<_>>())
-                .await
-                .map_err(|_| vortex_err!("ordered flatten did not warm the later partition"))??;
-
-        assert_eq!(collect_i32(chunks)?, [0, 100]);
-        Ok(())
-    }
-
-    struct PanickingStream;
-
-    impl Stream for PanickingStream {
-        type Item = VortexResult<ArrayRef>;
-
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            panic!("boom")
-        }
-    }
-
-    #[tokio::test]
-    async fn ordered_flatten_surfaces_a_partition_panic_as_an_error() -> VortexResult<()> {
-        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let panicking = ArrayStreamAdapter::new(dtype, PanickingStream).boxed();
-
-        let streams = futures::stream::iter([Ok::<_, VortexError>(panicking)]);
-        let flattened = flatten_scan_streams(streams, true, 1, TokioRuntime::current());
-        let result = flattened.try_collect::<Vec<_>>().await;
-
-        assert!(
-            result.is_err(),
-            "a panicking ordered partition must surface as an error, not silent truncation"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ordered_flatten_cancels_all_warmed_drains_when_dropped() -> VortexResult<()> {
-        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let started = Arc::new(Notify::new());
-        let mut dropped_recvs = Vec::new();
-        let mut streams = Vec::new();
-        for _ in 0..3 {
-            let (dropped_send, dropped_recv) = oneshot::channel();
-            dropped_recvs.push(dropped_recv);
-            let pending = ArrayStreamAdapter::new(
-                dtype.clone(),
-                DropNotifyingPendingStream {
-                    started: Arc::clone(&started),
-                    _drop_notifier: DropNotifier(Some(dropped_send)),
-                },
-            )
-            .boxed();
-            streams.push(Ok::<_, VortexError>(pending));
-        }
-
-        // A concurrency of 4 yields a lookahead of 4, so all three partitions warm (spawn their
-        // drains) concurrently before the first one is drained.
-        let streams = futures::stream::iter(streams);
-        let mut flattened = flatten_scan_streams(streams, true, 4, TokioRuntime::current());
-        let mut next = Box::pin(futures::StreamExt::next(&mut flattened));
-        tokio::select! {
-            _ = started.notified() => {}
-            _ = &mut next => return Err(vortex_err!("pending drain unexpectedly produced a chunk")),
-        }
-        drop(next);
-        drop(flattened);
-
-        for dropped_recv in dropped_recvs {
-            let dropped = tokio::time::timeout(Duration::from_secs(1), dropped_recv)
-                .await
-                .map_err(|_| {
-                    vortex_err!("dropping the flattened stream did not cancel every warmed drain")
-                })?;
-            dropped
-                .map_err(|_| vortex_err!("pending source dropped without notifying the test"))?;
-        }
-        Ok(())
     }
 }
