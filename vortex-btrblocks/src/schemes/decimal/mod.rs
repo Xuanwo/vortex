@@ -14,6 +14,7 @@ use vortex_array::arrays::decimal::narrowed_decimal;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_decimal_byte_parts::DecimalByteParts;
+use vortex_decimal_byte_parts::DecimalBytePartsSlots;
 use vortex_decimal_byte_parts::MAX_LOWER_PARTS;
 use vortex_decimal_byte_parts::split_decimal;
 use vortex_error::VortexResult;
@@ -50,7 +51,7 @@ impl Scheme for DecimalScheme {
 
     /// Children: msp=0, lower parts=1..=3.
     fn num_children(&self) -> usize {
-        1 + MAX_LOWER_PARTS
+        DecimalBytePartsSlots::FIXED_COUNT + MAX_LOWER_PARTS
     }
 
     fn expected_compression_ratio(
@@ -74,13 +75,25 @@ impl Scheme for DecimalScheme {
         let decimal = narrowed_decimal(decimal);
         let parts = split_decimal(&decimal)?;
 
-        let msp = compressor.compress_child(&parts.msp, &compress_ctx, self.id(), 0, exec_ctx)?;
+        let msp = compressor.compress_child(
+            &parts.msp,
+            &compress_ctx,
+            self.id(),
+            DecimalBytePartsSlots::MSP,
+            exec_ctx,
+        )?;
         let lower_parts = parts
             .lower_parts
             .iter()
             .enumerate()
             .map(|(idx, part)| {
-                compressor.compress_child(part, &compress_ctx, self.id(), idx + 1, exec_ctx)
+                compressor.compress_child(
+                    part,
+                    &compress_ctx,
+                    self.id(),
+                    DecimalBytePartsSlots::LOWER_PARTS_OFFSET + idx,
+                    exec_ctx,
+                )
             })
             .collect::<VortexResult<Vec<_>>>()?;
 

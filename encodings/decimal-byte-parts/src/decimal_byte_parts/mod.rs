@@ -16,10 +16,7 @@ mod slice;
 pub(crate) mod testing;
 
 pub use limbs::DecimalParts;
-pub use limbs::LOWER_PART_DTYPE;
 pub use limbs::MAX_LOWER_PARTS;
-pub use limbs::assemble_decimal;
-pub use limbs::assembled_values_type;
 pub use limbs::split_decimal;
 use prost::Message as _;
 use vortex_array::ArrayEq;
@@ -55,6 +52,9 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::decimal_byte_parts::limbs::LOWER_PART_DTYPE;
+use crate::decimal_byte_parts::limbs::assemble_decimal;
+use crate::decimal_byte_parts::limbs::assembled_values_type;
 use crate::decimal_byte_parts::limbs::combine_i128;
 use crate::decimal_byte_parts::limbs::combine_i256;
 use crate::decimal_byte_parts::rules::PARENT_RULES;
@@ -86,7 +86,7 @@ impl DecimalBytesPartsMetadata {
     /// # Errors
     ///
     /// Returns an error if the count exceeds [`MAX_LOWER_PARTS`].
-    fn lower_parts(&self) -> VortexResult<usize> {
+    fn lower_part_count(&self) -> VortexResult<usize> {
         let count = usize::try_from(self.lower_part_count)
             .map_err(|_| vortex_err!("lower part count {} out of range", self.lower_part_count))?;
         vortex_ensure!(
@@ -180,7 +180,7 @@ impl VTable for DecimalByteParts {
 
         let encoded_dtype = DType::Primitive(metadata.zeroth_child_ptype(), dtype.nullability());
 
-        let lower_part_count = metadata.lower_parts()?;
+        let lower_part_count = metadata.lower_part_count()?;
         vortex_ensure!(
             children.len() == DecimalBytePartsSlots::FIXED_COUNT + lower_part_count,
             "expected {} children, got {}",
@@ -248,14 +248,6 @@ impl Display for DecimalBytePartsData {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
-}
-
-/// The parts of a [`DecimalBytePartsArray`].
-pub struct DecimalBytePartsDataParts {
-    /// The most significant part, carrying the array's validity.
-    pub msp: ArrayRef,
-    /// The remaining 64-bit windows, most significant first.
-    pub lower_parts: Vec<ArrayRef>,
 }
 
 impl DecimalBytePartsData {
@@ -361,6 +353,48 @@ fn values_type(array: ArrayView<'_, DecimalByteParts>) -> VortexResult<DecimalTy
     assembled_values_type(array.msp().dtype().as_ptype(), array.lower_parts().len())
 }
 
+/// The decimal dtype this array carries.
+///
+/// Guaranteed to be a decimal by construction: [`DecimalBytePartsData::validate`] rejects
+/// every other dtype.
+pub(crate) fn decimal_dtype(array: ArrayView<'_, DecimalByteParts>) -> DecimalDType {
+    *array
+        .dtype()
+        .as_decimal_opt()
+        .vortex_expect("must be a decimal dtype")
+}
+
+/// Rebuild the array by applying `f` to the MSP and to every lower part, in slot order.
+///
+/// Part-wise operations must touch every part. Going through this rather than calling
+/// [`DecimalByteParts::try_new_with_lower_parts`] directly makes dropping a lower part —
+/// which silently corrupts wide values — unrepresentable.
+pub(crate) fn map_parts(
+    array: ArrayView<'_, DecimalByteParts>,
+    mut f: impl FnMut(&ArrayRef) -> VortexResult<ArrayRef>,
+) -> VortexResult<DecimalBytePartsArray> {
+    let msp = f(array.msp())?;
+    let lower_parts = array
+        .lower_parts()
+        .iter()
+        .map(&mut f)
+        .collect::<VortexResult<Vec<_>>>()?;
+    DecimalByteParts::try_new_with_lower_parts(msp, lower_parts, decimal_dtype(array))
+}
+
+/// Rebuild the array with a replacement MSP, keeping its lower parts untouched.
+///
+/// Only valid for operations that cannot change a row's magnitude bits — a nullability cast
+/// or a mask — since the lower parts keep whatever bits they held. That is sound because
+/// validity lives in the MSP alone, so lower-part bits in a null row are already undefined.
+pub(crate) fn with_msp(
+    array: ArrayView<'_, DecimalByteParts>,
+    msp: ArrayRef,
+    decimal_dtype: DecimalDType,
+) -> VortexResult<DecimalBytePartsArray> {
+    DecimalByteParts::try_new_with_lower_parts(msp, array.lower_parts().to_vec(), decimal_dtype)
+}
+
 /// Converts a DecimalBytePartsArray to its canonical DecimalArray representation.
 fn to_canonical_decimal(
     array: &DecimalBytePartsArray,
@@ -373,12 +407,7 @@ fn to_canonical_decimal(
         .map(|part| part.clone().execute::<PrimitiveArray>(ctx))
         .collect::<VortexResult<Vec<_>>>()?;
 
-    let decimal_dtype = *array
-        .dtype()
-        .as_decimal_opt()
-        .vortex_expect("must be a decimal dtype");
-
-    Ok(assemble_decimal(&msp, &lower_parts, decimal_dtype)?.into_array())
+    Ok(assemble_decimal(&msp, &lower_parts, decimal_dtype(array.as_view()))?.into_array())
 }
 
 impl OperationsVTable<DecimalByteParts> for DecimalByteParts {
@@ -405,10 +434,13 @@ impl OperationsVTable<DecimalByteParts> for DecimalByteParts {
             })
             .collect::<VortexResult<Vec<_>>>()?;
 
-        let value = match values_type(array)? {
-            _ if lower_parts.is_empty() => DecimalValue::I64(msp),
-            DecimalType::I256 => DecimalValue::I256(combine_i256(msp, lower_parts.into_iter())),
-            _ => DecimalValue::I128(combine_i128(msp, lower_parts)),
+        let value = if lower_parts.is_empty() {
+            DecimalValue::I64(msp)
+        } else {
+            match values_type(array)? {
+                DecimalType::I256 => DecimalValue::I256(combine_i256(msp, lower_parts.into_iter())),
+                _ => DecimalValue::I128(combine_i128(msp, lower_parts)),
+            }
         };
 
         Scalar::try_new(array.dtype().clone(), Some(ScalarValue::Decimal(value)))

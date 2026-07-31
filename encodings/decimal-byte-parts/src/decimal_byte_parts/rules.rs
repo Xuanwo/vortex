@@ -11,11 +11,10 @@ use vortex_array::optimizer::rules::ArrayParentReduceRule;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar_fn::fns::cast::CastReduceAdaptor;
 use vortex_array::scalar_fn::fns::mask::MaskReduceAdaptor;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
-use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
+use crate::decimal_byte_parts::map_parts;
 
 pub(super) const PARENT_RULES: ParentRuleSet<DecimalByteParts> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&DecimalBytePartsFilterPushDownRule),
@@ -39,21 +38,7 @@ impl ArrayParentReduceRule<DecimalByteParts> for DecimalBytePartsFilterPushDownR
     ) -> VortexResult<Option<ArrayRef>> {
         // TODO(ngates): we should benchmark whether to push-down filters with "lower parts",
         //  which filters each part separately rather than the canonical wide buffer once.
-        let new_msp = child.msp().filter(parent.filter_mask().clone())?;
-        let new_lower_parts = child
-            .lower_parts()
-            .iter()
-            .map(|part| part.filter(parent.filter_mask().clone()))
-            .collect::<VortexResult<Vec<_>>>()?;
-        let new_child = DecimalByteParts::try_new_with_lower_parts(
-            new_msp,
-            new_lower_parts,
-            *child
-                .dtype()
-                .as_decimal_opt()
-                .vortex_expect("must be a decimal dtype"),
-        )?
-        .into_array();
-        Ok(Some(new_child))
+        map_parts(child, |part| part.filter(parent.filter_mask().clone()))
+            .map(|c| Some(c.into_array()))
     }
 }

@@ -8,25 +8,42 @@
 //! obvious shapes are:
 //!
 //! - **row**: one pass, gathering the row's word from each part and combining. Sub-variants
-//!   differ only in whether the part count is known to the compiler.
-//! - **column**: one pass per part over the whole output, either accumulating into the wide
-//!   values or writing 64-bit lanes directly.
+//!   differ in whether the part count is known to the compiler (`_const` vs `_dynamic`) and
+//!   in whether the output is pushed into a reserved buffer or stored into a pre-sized one
+//!   (`_write`).
+//! - **column**: one pass per part over the whole output, writing 64-bit lanes directly.
 //!
 //! Every candidate is spelled out here rather than called through the crate, so the same
-//! comparison can be run from any revision. `assemble_*_shipped` calls the public API and
-//! pins whichever shape the crate currently uses.
+//! comparison can be run from any revision. `canonicalize_byte_parts` goes through the array
+//! API instead, and so tracks whichever shape the crate currently ships.
 //!
-//! At 65,536 rows the row shape wins, and what costs is a part count the compiler cannot
-//! see, not the row-at-a-time access: specializing it is 1.25x (`i128`) and 1.8x (`i256`).
-//! Columnar loses for `i256` because each lane store is strided by 32 bytes — 2.2x slower
-//! than the specialized row loop, still 1.6x when cache blocked, and 11x when expressed as
-//! whole-value shifts. For `i128` the two-pass column shape ties the specialized row loop:
-//! at 16 bytes per row both are memory bound.
+//! At 65,536 rows the row shape wins, but for two different reasons per width, and neither
+//! is the row-at-a-time access itself:
+//!
+//! - `i256` is dominated by the part count being invisible to the compiler. Specializing it
+//!   is 1.85x. How the output is written barely matters (`_write` ties `_const`), because at
+//!   32 bytes per row the stores dominate either way.
+//! - `i128` is dominated by the write. Specializing the part count is worth only ~1.04x,
+//!   while storing into a pre-sized buffer instead of pushing is 1.6x — the bounds-checked
+//!   `push` is the whole cost at 16 bytes per row.
+//!
+//! Columnar always loses. For `i256` each lane store is strided by 32 bytes, 2.3x slower than
+//! the specialized row loop. For `i128` the two-pass column shape beats the *pushing* row
+//! loop but still loses to the single-pass `_write` row loop, so the two passes buy nothing
+//! once the push is gone.
+//!
+//! Two further `i256` columnar variants were measured and then removed rather than left here
+//! to rot: cache blocking the lane passes over 1024-row blocks recovered part of the strided
+//! stores but was still 1.6x slower than the row loop, and expressing the passes as
+//! whole-value `i256` shifts was 11x slower.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
 use divan::Bencher;
 use divan::black_box;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::DecimalDType;
@@ -35,7 +52,6 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
-use vortex_decimal_byte_parts::assemble_decimal;
 
 fn main() {
     divan::main();
@@ -45,23 +61,12 @@ fn main() {
 /// in L2, so the extra passes of a columnar shape are paid at their real cost.
 const LEN: usize = 65_536;
 
-/// Rows per block in the cache-blocked columnar variant: the block's output (32 KiB of
-/// `i256`) stays in L1 across all four lane passes.
-const BLOCK: usize = 1024;
-
 const WORD_BITS: usize = 64;
 
 /// Deterministic pseudo-random words, so no part is constant or a sequence.
 fn words(seed: u64, len: usize) -> Buffer<u64> {
-    let mut state = seed;
-    (0..len)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            state
-        })
-        .collect()
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..len).map(|_| rng.random()).collect()
 }
 
 fn msp(seed: u64, len: usize) -> Buffer<i64> {
@@ -109,6 +114,16 @@ fn i128_column(msp: &[i64], lower: &[u64]) -> Buffer<i128> {
     out.freeze()
 }
 
+/// The row shape writing into a pre-sized buffer rather than pushing into a reserved one,
+/// to separate "one pass vs two" from "bounds-checked push vs direct store".
+fn i128_row_write(msp: &[i64], lower: &[u64]) -> Buffer<i128> {
+    let mut out = BufferMut::<i128>::zeroed(msp.len());
+    for ((o, m), l) in out.as_mut_slice().iter_mut().zip(msp).zip(lower) {
+        *o = (i128::from(*m) << WORD_BITS) | i128::from(*l);
+    }
+    out.freeze()
+}
+
 // ---------------------------------------------------------------------------------------
 // i256: three lower parts
 // ---------------------------------------------------------------------------------------
@@ -145,21 +160,6 @@ fn i256_row_const(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
     out.freeze()
 }
 
-/// The column shape as wide arithmetic: one pass per part, each shifting the whole output
-/// left and ORing the part in. Four read-modify-write passes over 32 bytes per row.
-fn i256_column_accumulate(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
-    let mut out = BufferMut::<i256>::zeroed(msp.len());
-    for (o, m) in out.as_mut_slice().iter_mut().zip(msp) {
-        *o = i256::from_i128(i128::from(*m));
-    }
-    for part in lower {
-        for (o, w) in out.as_mut_slice().iter_mut().zip(part) {
-            *o = (*o << WORD_BITS) | i256::from_parts(u128::from(*w), 0);
-        }
-    }
-    out.freeze()
-}
-
 /// The column shape as lane writes: build the output as 64-bit words and write one lane per
 /// pass. Avoids re-reading the output, but every store is strided by 32 bytes.
 fn i256_column_lanes(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
@@ -179,25 +179,21 @@ fn i256_column_lanes(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
     Buffer::<i256>::from_byte_buffer_aligned(w.freeze().into_byte_buffer(), Alignment::of::<i256>())
 }
 
-/// The column shape, cache blocked: the lane passes run over one block of rows at a time so
-/// the block's output stays resident between passes.
-fn i256_column_lanes_blocked(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
-    let len = msp.len();
-    let mut w = BufferMut::<u64>::zeroed_aligned(len * 4, Alignment::of::<i256>());
-    let lanes = w.as_mut_slice();
-    for start in (0..len).step_by(BLOCK) {
-        let end = (start + BLOCK).min(len);
-        for i in start..end {
-            lanes[i * 4 + 3] = msp[i].cast_unsigned();
+/// The specialized row shape for `i256`, writing into a pre-sized buffer.
+fn i256_row_write<const K: usize>(msp: &[i64], lower: [&[u64]; K]) -> Buffer<i256> {
+    let mut out = BufferMut::<i256>::zeroed(msp.len());
+    for (row, (o, m)) in out.as_mut_slice().iter_mut().zip(msp).enumerate() {
+        let mut words = [if *m < 0 { u64::MAX } else { 0 }; 4];
+        for (i, part) in lower.iter().enumerate() {
+            words[K - 1 - i] = part[row];
         }
-        for (lane, part) in lower.iter().enumerate() {
-            for i in start..end {
-                lanes[i * 4 + 2 - lane] = part[i];
-            }
-        }
+        words[K] = m.cast_unsigned();
+        *o = i256::from_parts(
+            u128::from(words[0]) | (u128::from(words[1]) << WORD_BITS),
+            (u128::from(words[2]) | (u128::from(words[3]) << WORD_BITS)).cast_signed(),
+        );
     }
-    assert!(cfg!(target_endian = "little"));
-    Buffer::<i256>::from_byte_buffer_aligned(w.freeze().into_byte_buffer(), Alignment::of::<i256>())
+    out.freeze()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -254,6 +250,13 @@ fn i128_column_parts(bencher: Bencher) {
 }
 
 #[divan::bench]
+fn i128_row_write_parts(bencher: Bencher) {
+    let parts = Parts::new(1);
+    let lower = parts.lower_slices();
+    bencher.bench(|| i128_row_write(black_box(parts.msp.as_slice()), black_box(lower[0])));
+}
+
+#[divan::bench]
 fn i256_row_dynamic_parts(bencher: Bencher) {
     let parts = Parts::new(3);
     let lower = parts.lower_slices();
@@ -269,14 +272,6 @@ fn i256_row_const_parts(bencher: Bencher) {
 }
 
 #[divan::bench]
-fn i256_column_accumulate_parts(bencher: Bencher) {
-    let parts = Parts::new(3);
-    let lower = parts.lower_slices();
-    let lower = [lower[0], lower[1], lower[2]];
-    bencher.bench(|| i256_column_accumulate(black_box(parts.msp.as_slice()), black_box(lower)));
-}
-
-#[divan::bench]
 fn i256_column_lanes_parts(bencher: Bencher) {
     let parts = Parts::new(3);
     let lower = parts.lower_slices();
@@ -284,35 +279,16 @@ fn i256_column_lanes_parts(bencher: Bencher) {
     bencher.bench(|| i256_column_lanes(black_box(parts.msp.as_slice()), black_box(lower)));
 }
 
+/// Canonicalizing through the public array API, so the child execution and validity handling
+/// around the assembly loop are included.
 #[divan::bench]
-fn i256_column_lanes_blocked_parts(bencher: Bencher) {
+fn i256_row_write_parts(bencher: Bencher) {
     let parts = Parts::new(3);
     let lower = parts.lower_slices();
     let lower = [lower[0], lower[1], lower[2]];
-    bencher.bench(|| i256_column_lanes_blocked(black_box(parts.msp.as_slice()), black_box(lower)));
+    bencher.bench(|| i256_row_write(black_box(parts.msp.as_slice()), black_box(lower)));
 }
 
-/// The shape the crate actually ships, including the buffer allocation and the ptype
-/// dispatch, for one lower part.
-#[divan::bench]
-fn i128_assemble_shipped(bencher: Bencher) {
-    let parts = Parts::new(1);
-    let (msp, lower) = parts.arrays();
-    let dtype = DecimalDType::new(38, 2);
-    bencher.bench(|| assemble_decimal(black_box(&msp), black_box(&lower), dtype).unwrap());
-}
-
-/// The shape the crate actually ships, for three lower parts.
-#[divan::bench]
-fn i256_assemble_shipped(bencher: Bencher) {
-    let parts = Parts::new(3);
-    let (msp, lower) = parts.arrays();
-    let dtype = DecimalDType::new(76, 2);
-    bencher.bench(|| assemble_decimal(black_box(&msp), black_box(&lower), dtype).unwrap());
-}
-
-/// Canonicalizing through the public array API, so the child execution and validity handling
-/// around the assembly loop are included.
 #[divan::bench(args = [1, 3])]
 fn canonicalize_byte_parts(bencher: Bencher, lower_parts: usize) {
     use vortex_array::VortexSessionExecute;

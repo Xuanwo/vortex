@@ -4,6 +4,9 @@
 use std::iter;
 use std::sync::LazyLock;
 
+use rand::RngExt;
+use rand::SeedableRng as _;
+use rand::rngs::StdRng;
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
@@ -37,13 +40,8 @@ fn ten_pow(exp: u32) -> i256 {
 /// Deterministic 24-bit noise, so the low part of each value is neither constant nor a
 /// sequence — the realistic shape for a wide decimal column with a large fixed magnitude.
 fn noise(seed: u64) -> impl Iterator<Item = i128> {
-    let mut state = seed;
-    iter::repeat_with(move || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        i128::from(state >> 40)
-    })
+    let mut rng = StdRng::seed_from_u64(seed);
+    iter::repeat_with(move || i128::from(rng.random::<u32>() >> 8))
 }
 
 /// `i128`-backed values that need more than 64 bits, so the encoding must carry one lower

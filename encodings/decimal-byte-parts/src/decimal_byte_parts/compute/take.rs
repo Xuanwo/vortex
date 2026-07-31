@@ -6,11 +6,11 @@ use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::dict::TakeExecute;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
 use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
+use crate::decimal_byte_parts::map_parts;
 
 impl TakeExecute for DecimalByteParts {
     fn take(
@@ -25,21 +25,7 @@ impl TakeExecute for DecimalByteParts {
             return Ok(None);
         }
 
-        let lower_parts = array
-            .lower_parts()
-            .iter()
-            .map(|part| part.take(indices.clone()))
-            .collect::<VortexResult<Vec<_>>>()?;
-
-        DecimalByteParts::try_new_with_lower_parts(
-            array.msp().take(indices.clone())?,
-            lower_parts,
-            *array
-                .dtype()
-                .as_decimal_opt()
-                .vortex_expect("must be a decimal dtype"),
-        )
-        .map(|a| Some(a.into_array()))
+        map_parts(array, |part| part.take(indices.clone())).map(|a| Some(a.into_array()))
     }
 }
 

@@ -7,30 +7,13 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::IntoArray;
 use vortex_array::arrays::slice::SliceReduce;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
-use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
+use crate::decimal_byte_parts::map_parts;
 
 impl SliceReduce for DecimalByteParts {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        let lower_parts = array
-            .lower_parts()
-            .iter()
-            .map(|part| part.slice(range.clone()))
-            .collect::<VortexResult<Vec<_>>>()?;
-
-        Ok(Some(
-            DecimalByteParts::try_new_with_lower_parts(
-                array.msp().slice(range)?,
-                lower_parts,
-                *array
-                    .dtype()
-                    .as_decimal_opt()
-                    .vortex_expect("must be a decimal dtype"),
-            )?
-            .into_array(),
-        ))
+        map_parts(array, |part| part.slice(range.clone())).map(|d| Some(d.into_array()))
     }
 }

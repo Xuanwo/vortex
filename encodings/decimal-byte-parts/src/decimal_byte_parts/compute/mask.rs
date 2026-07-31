@@ -8,11 +8,12 @@ use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::fns::mask::Mask as MaskExpr;
 use vortex_array::scalar_fn::fns::mask::MaskReduce;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
 use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
+use crate::decimal_byte_parts::decimal_dtype;
+use crate::decimal_byte_parts::with_msp;
 
 impl MaskReduce for DecimalByteParts {
     fn mask(array: ArrayView<'_, Self>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
@@ -23,16 +24,6 @@ impl MaskReduce for DecimalByteParts {
             EmptyOptions,
             [array.msp().clone(), mask.clone()],
         )?;
-        Ok(Some(
-            DecimalByteParts::try_new_with_lower_parts(
-                masked_msp,
-                array.lower_parts().to_vec(),
-                *array
-                    .dtype()
-                    .as_decimal_opt()
-                    .vortex_expect("must be a decimal dtype"),
-            )?
-            .into_array(),
-        ))
+        with_msp(array, masked_msp, decimal_dtype(array)).map(|a| Some(a.into_array()))
     }
 }

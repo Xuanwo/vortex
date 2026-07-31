@@ -46,7 +46,7 @@ const LOWER_PART_BITS: usize = 64;
 /// The dtype every lower part must have: a non-nullable `u64`.
 ///
 /// Validity is carried by the most significant part alone.
-pub const LOWER_PART_DTYPE: DType = DType::Primitive(PType::U64, Nullability::NonNullable);
+pub(crate) const LOWER_PART_DTYPE: DType = DType::Primitive(PType::U64, Nullability::NonNullable);
 
 /// A decimal array decomposed into byte parts.
 pub struct DecimalParts {
@@ -62,7 +62,7 @@ pub struct DecimalParts {
 ///
 /// Returns an error if `msp_ptype` is not a signed integer, or if there are more than
 /// [`MAX_LOWER_PARTS`] lower parts.
-pub fn assembled_values_type(
+pub(crate) fn assembled_values_type(
     msp_ptype: PType,
     lower_part_count: usize,
 ) -> VortexResult<DecimalType> {
@@ -117,7 +117,7 @@ pub fn split_decimal(decimal: &DecimalArray) -> VortexResult<DecimalParts> {
 ///
 /// Returns an error if the parts do not describe a valid decimal, or if the MSP's validity
 /// cannot be derived.
-pub fn assemble_decimal(
+pub(crate) fn assemble_decimal(
     msp: &PrimitiveArray,
     lower_parts: &[PrimitiveArray],
     decimal_dtype: DecimalDType,
@@ -150,8 +150,9 @@ pub fn assemble_decimal(
     // The part count is dispatched to a constant so every 64-bit word lands at a compile-time
     // index. Leaving it dynamic costs 1.8x on the `i256` path — see `benches/decimal_assemble.rs`.
     let values = match assembled_values_type(msp.ptype(), lower.len())? {
+        // A single lower part can never widen to an `i256`: the MSP is at most 64 bits, so
+        // 64 + 64 fits an `i128` and takes the branch below.
         DecimalType::I256 => match lower.as_slice() {
-            [first] => assemble_i256(msp, [first]),
             [first, second] => assemble_i256(msp, [first, second]),
             [first, second, third] => assemble_i256(msp, [first, second, third]),
             _ => vortex_bail!("unsupported lower part count {}", lower.len()),
@@ -260,10 +261,20 @@ fn split_i256(values: &Buffer<i256>) -> (Buffer<i64>, [Buffer<u64>; MAX_LOWER_PA
     reason = "the widening to i64 is a no-op only for the i64 arm of the ptype match"
 )]
 fn assemble_i128(msp: &PrimitiveArray, lower: &[u64]) -> Buffer<i128> {
-    let mut out = BufferMut::<i128>::with_capacity(msp.len());
+    // Store into a pre-sized buffer rather than pushing into a reserved one: at 16 bytes per
+    // row the bounds-checked `push` dominates, and dropping it is 1.6x — see
+    // `i128_row_write` against `i128_row_const` in `benches/decimal_assemble.rs`. The same
+    // shape does not pay off for `i256`, where zeroing 32 bytes per row costs more than the
+    // push it saves.
+    let mut out = BufferMut::<i128>::zeroed(msp.len());
     match_each_signed_integer_ptype!(msp.ptype(), |P| {
-        for (value, part) in msp.as_slice::<P>().iter().zip(lower) {
-            out.push((i128::from(i64::from(*value)) << LOWER_PART_BITS) | i128::from(*part));
+        for ((slot, value), part) in out
+            .as_mut_slice()
+            .iter_mut()
+            .zip(msp.as_slice::<P>())
+            .zip(lower)
+        {
+            *slot = (i128::from(i64::from(*value)) << LOWER_PART_BITS) | i128::from(*part);
         }
     });
     out.freeze()

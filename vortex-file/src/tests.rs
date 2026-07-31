@@ -11,6 +11,9 @@ use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::pin_mut;
+use rand::RngExt;
+use rand::SeedableRng as _;
+use rand::rngs::StdRng;
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
@@ -240,13 +243,8 @@ async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
     /// Deterministic 24-bit noise, so the low bits of each value are neither constant nor a
     /// sequence.
     fn noise(seed: u64) -> impl Iterator<Item = i128> {
-        let mut state = seed;
-        iter::repeat_with(move || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            i128::from(state >> 40)
-        })
+        let mut rng = StdRng::seed_from_u64(seed);
+        iter::repeat_with(move || i128::from(rng.random::<u32>() >> 8))
     }
 
     // Values that need more than 64 bits, so `i128` storage cannot be narrowed away.
