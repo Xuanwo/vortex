@@ -20,6 +20,7 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
@@ -34,6 +35,11 @@ use vortex_geo::test_harness::nullable_multipolygon_column;
 use vortex_geo::test_harness::nullable_point_column;
 use vortex_geo::test_harness::point_column;
 use vortex_session::VortexSession;
+
+// Scalar function execution allocates its output inside the timed region, so use the vendored
+// allocator instead of measuring glibc differences between CodSpeed runner images.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();

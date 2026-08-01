@@ -10073,6 +10073,7 @@ dependencies = [
  "geo-types",
  "geoarrow",
  "geoarrow-cast",
+ "mimalloc",
  "prost 0.14.4",
  "rstest",
  "vortex-array",
@@ -10486,8 +10487,10 @@ version = "0.1.0"
 dependencies = [
  "arrow-array 58.4.0",
  "arrow-schema 58.4.0",
+ "codspeed-divan-compat",
  "half",
  "itertools 0.14.0",
+ "mimalloc",
  "num-traits",
  "prost 0.14.4",
  "rstest",
