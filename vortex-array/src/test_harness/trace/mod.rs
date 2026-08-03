@@ -17,6 +17,11 @@
 //! - **Execution**: `execute_until` iterations, single-step entries, parent kernel attempts and
 //!   matches, slot transitions, builder start/append/finish, and the eventual canonical output.
 //!
+//! Both parent dispatch chains are covered. An optimization of a heap array and one of borrowed
+//! construction parts ([`ArrayParts::optimize`](crate::array::ArrayParts::optimize)) record the
+//! same events, and a parent is summarized from its metadata via [`TraceArray`], so recording a
+//! trace never forces a stack-allocated parent to materialize.
+//!
 //! Despite the name `trace_op`, the harness is *not* a generic logging facility: it is closely
 //! coupled to the optimizer/executor state machines so that the resulting trace is stable enough
 //! to commit as a snapshot.
@@ -75,6 +80,13 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
 use crate::ArrayRef;
+use crate::array::ArrayId;
+use crate::array::ArrayView;
+use crate::array::ParentRef;
+use crate::array::ParentView;
+use crate::array::VTable;
+use crate::display::EncodingSummaryExtractor;
+use crate::dtype::DType;
 
 /// Controls how much rule and kernel resolution detail is captured.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -332,40 +344,86 @@ impl From<TraceResolution> for TraceInterest {
     }
 }
 
-/// Snapshot-friendly wrapper around [`ArrayRef`] that renders the encoding, dtype, and length
-/// using the canonical [`Display`] format (`vortex.primitive(i32, len=4)`).
+/// Snapshot-friendly summary of an array that renders the encoding, dtype, and length using the
+/// canonical [`Display`] format (`vortex.primitive(i32, len=4)`).
 ///
-/// Carries a clone of the [`ArrayRef`] instead of duplicating fields,
-/// so trace events stay small and share the same rendering as every other `{array}` print in
-/// the codebase.
+/// Carries the three summary fields rather than a cloned [`ArrayRef`] because the parent side of
+/// the dispatch chain is a [`ParentRef`], which may borrow construction parts that have not been
+/// heap-allocated yet. Recording a trace event must never be the reason a parent materializes, so
+/// the summary is captured from metadata alone. Rendering goes through
+/// [`EncodingSummaryExtractor`] so a traced array prints exactly like every other `{array}` print
+/// in the codebase.
 #[derive(Clone, Debug)]
-pub(crate) struct ArraySummary(ArrayRef);
+pub(crate) struct ArraySummary {
+    encoding_id: ArrayId,
+    dtype: DType,
+    len: usize,
+}
 
 impl ArraySummary {
-    pub(crate) fn new(array: &ArrayRef) -> Self {
-        Self(array.clone())
+    fn new(encoding_id: ArrayId, dtype: &DType, len: usize) -> Self {
+        Self {
+            encoding_id,
+            dtype: dtype.clone(),
+            len,
+        }
     }
 }
 
 impl Display for ArraySummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
+        EncodingSummaryExtractor::write_parts(self.encoding_id, &self.dtype, self.len, f)
     }
 }
 
-pub(crate) fn record_optimize_start(root: &ArrayRef, session: bool) {
+/// An array the trace harness can summarize without materializing it.
+///
+/// Implemented for both dispatch chains: the heap-backed [`ArrayRef`] and [`ArrayView`], and the
+/// possibly stack-backed [`ParentRef`] and [`ParentView`]. The `record_*` functions take
+/// `&impl TraceArray` for subject and parent arguments, so a single signature serves an optimizer
+/// pass over a heap array and a parent-reduce over borrowed [`ArrayParts`](crate::array::ArrayParts).
+pub(crate) trait TraceArray {
+    /// Capture this array's encoding, dtype, and length.
+    fn trace_summary(&self) -> ArraySummary;
+}
+
+impl TraceArray for ArrayRef {
+    fn trace_summary(&self) -> ArraySummary {
+        ArraySummary::new(self.encoding_id(), self.dtype(), self.len())
+    }
+}
+
+impl TraceArray for ParentRef<'_> {
+    fn trace_summary(&self) -> ArraySummary {
+        ArraySummary::new(self.encoding_id(), self.dtype(), self.len())
+    }
+}
+
+impl<V: VTable> TraceArray for ArrayView<'_, V> {
+    fn trace_summary(&self) -> ArraySummary {
+        ArraySummary::new(self.encoding_id(), self.dtype(), self.len())
+    }
+}
+
+impl<V: VTable> TraceArray for ParentView<'_, V> {
+    fn trace_summary(&self) -> ArraySummary {
+        ArraySummary::new(self.encoding_id(), self.dtype(), self.len())
+    }
+}
+
+pub(crate) fn record_optimize_start(root: &impl TraceArray, session: bool) {
     record(TraceEvent::OptimizeStart {
-        root: ArraySummary::new(root),
+        root: root.trace_summary(),
         session,
     });
 }
 
-pub(crate) fn record_optimize_loop_start(array: &ArrayRef) {
+pub(crate) fn record_optimize_loop_start(array: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
     record(TraceEvent::OptimizeLoopStart {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
@@ -376,7 +434,7 @@ pub(crate) fn record_optimize_loop_end() {
     record(TraceEvent::OptimizeLoopEnd);
 }
 
-pub(crate) fn record_optimize_reduce_none(array: &ArrayRef) {
+pub(crate) fn record_optimize_reduce_none(array: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
@@ -384,11 +442,11 @@ pub(crate) fn record_optimize_reduce_none(array: &ArrayRef) {
         indent: 0,
         phase: "reduce",
         subject: "array",
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
-pub(crate) fn record_optimize_parent_reduce_none(array: &ArrayRef) {
+pub(crate) fn record_optimize_parent_reduce_none(array: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
@@ -396,52 +454,52 @@ pub(crate) fn record_optimize_parent_reduce_none(array: &ArrayRef) {
         indent: 0,
         phase: "reduce_parent",
         subject: "array",
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
 pub(crate) fn record_optimize_done(output: &ArrayRef, changed: bool) {
     record(TraceEvent::OptimizeDone {
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
         changed,
     });
 }
 
-pub(crate) fn record_optimize_recursive_start(root: &ArrayRef) {
+pub(crate) fn record_optimize_recursive_start(root: &impl TraceArray) {
     record(TraceEvent::OptimizeRecursiveStart {
-        root: ArraySummary::new(root),
+        root: root.trace_summary(),
     });
 }
 
 pub(crate) fn record_optimize_recursive_slot(slot_idx: usize, input: &ArrayRef, output: &ArrayRef) {
     record(TraceEvent::OptimizeRecursiveSlot {
         slot_idx,
-        input: ArraySummary::new(input),
-        output: ArraySummary::new(output),
+        input: input.trace_summary(),
+        output: output.trace_summary(),
     });
 }
 
-pub(crate) fn record_reduce_applied(array: &ArrayRef, rule: &dyn Debug, output: &ArrayRef) {
+pub(crate) fn record_reduce_applied(array: &impl TraceArray, rule: &dyn Debug, output: &ArrayRef) {
     record(TraceEvent::ReduceApplied {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
         rule: compact_label(rule),
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
     });
 }
 
-pub(crate) fn record_reduce_declined(array: &ArrayRef, rule: &dyn Debug) {
+pub(crate) fn record_reduce_declined(array: &impl TraceArray, rule: &dyn Debug) {
     if !attempts_enabled() {
         return;
     }
     record(TraceEvent::ReduceAttempt {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
         rule: compact_label(rule),
         outcome: AttemptOutcome::Declined,
     });
 }
 
 pub(crate) fn record_session_parent_reduce_applied(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     plugin_idx: usize,
@@ -458,7 +516,7 @@ pub(crate) fn record_session_parent_reduce_applied(
 }
 
 pub(crate) fn record_session_parent_reduce_declined(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     plugin_idx: usize,
@@ -474,7 +532,7 @@ pub(crate) fn record_session_parent_reduce_declined(
 }
 
 pub(crate) fn record_static_parent_reduce_no_match(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     rule: &dyn Debug,
@@ -490,7 +548,7 @@ pub(crate) fn record_static_parent_reduce_no_match(
 }
 
 pub(crate) fn record_static_parent_reduce_applied(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     rule: &dyn Debug,
@@ -507,7 +565,7 @@ pub(crate) fn record_static_parent_reduce_applied(
 }
 
 pub(crate) fn record_static_parent_reduce_declined(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     rule: &dyn Debug,
@@ -523,7 +581,7 @@ pub(crate) fn record_static_parent_reduce_declined(
 }
 
 fn record_parent_reduce_attempt(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     source: TraceSource,
@@ -534,8 +592,8 @@ fn record_parent_reduce_attempt(
         return;
     }
     record(TraceEvent::ParentReduceAttempt {
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
         slot_idx,
         source,
         rule: rule.into(),
@@ -544,7 +602,7 @@ fn record_parent_reduce_attempt(
 }
 
 fn record_parent_reduce_applied(
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     source: TraceSource,
@@ -552,19 +610,19 @@ fn record_parent_reduce_applied(
     output: &ArrayRef,
 ) {
     record(TraceEvent::ParentReduceApplied {
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
         slot_idx,
         source,
         rule: rule.into(),
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
     });
 }
 
 pub(crate) fn record_execute_until_start<M>(root: &ArrayRef) {
     record(TraceEvent::ExecuteUntilStart {
         target: short_type_name::<M>(),
-        root: ArraySummary::new(root),
+        root: root.trace_summary(),
     });
 }
 
@@ -576,8 +634,8 @@ pub(crate) fn record_execute_until_iteration(
 ) {
     record(TraceEvent::ExecuteUntilIteration {
         iteration,
-        current: ArraySummary::new(current),
-        stack_parent: stack_parent.map(|(array, slot_idx)| (ArraySummary::new(array), slot_idx)),
+        current: current.trace_summary(),
+        stack_parent: stack_parent.map(|(array, slot_idx)| (array.trace_summary(), slot_idx)),
         builder_active,
     });
 }
@@ -591,20 +649,20 @@ pub(crate) fn record_execute_until_done_check(target: bool, canonical: bool) {
 
 pub(crate) fn record_execute_until_return(output: &ArrayRef) {
     record(TraceEvent::ExecuteUntilReturn {
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
     });
 }
 
 pub(crate) fn record_execute_until_pop_frame(slot_idx: usize, output: &ArrayRef) {
     record(TraceEvent::ExecuteUntilPopFrame {
         slot_idx,
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
     });
 }
 
 pub(crate) fn record_session_execute_parent_applied(
     phase: &'static str,
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     plugin_idx: usize,
@@ -623,7 +681,7 @@ pub(crate) fn record_session_execute_parent_applied(
 
 pub(crate) fn record_session_execute_parent_declined(
     phase: &'static str,
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     plugin_idx: usize,
@@ -641,7 +699,7 @@ pub(crate) fn record_session_execute_parent_declined(
 
 fn record_execute_parent_attempt(
     phase: &'static str,
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     source: TraceSource,
@@ -653,8 +711,8 @@ fn record_execute_parent_attempt(
     }
     record(TraceEvent::ExecuteParentAttempt {
         phase,
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
         slot_idx,
         source,
         kernel: kernel.into(),
@@ -664,7 +722,7 @@ fn record_execute_parent_attempt(
 
 fn record_execute_parent_applied(
     phase: &'static str,
-    parent: &ArrayRef,
+    parent: &impl TraceArray,
     child: &ArrayRef,
     slot_idx: usize,
     source: TraceSource,
@@ -673,16 +731,16 @@ fn record_execute_parent_applied(
 ) {
     record(TraceEvent::ExecuteParentApplied {
         phase,
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
         slot_idx,
         source,
         kernel: kernel.into(),
-        output: ArraySummary::new(output),
+        output: output.trace_summary(),
     });
 }
 
-pub(crate) fn record_execute_parent_none(phase: &'static str, current: &ArrayRef) {
+pub(crate) fn record_execute_parent_none(phase: &'static str, current: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
@@ -690,7 +748,7 @@ pub(crate) fn record_execute_parent_none(phase: &'static str, current: &ArrayRef
         indent: 2,
         phase,
         subject: "current",
-        array: ArraySummary::new(current),
+        array: current.trace_summary(),
     });
 }
 
@@ -700,27 +758,27 @@ pub(crate) fn record_execute_optimized(input: &ArrayRef, output: &ArrayRef) {
         return;
     }
     record(TraceEvent::ExecuteOptimized {
-        input: ArraySummary::new(input),
-        output: ArraySummary::new(output),
+        input: input.trace_summary(),
+        output: output.trace_summary(),
         changed,
     });
 }
 
-pub(crate) fn record_execute_encoding(array: &ArrayRef) {
+pub(crate) fn record_execute_encoding(array: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
     record(TraceEvent::ExecuteEncoding {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
-pub(crate) fn record_execute_slot(slot_idx: usize, parent: &ArrayRef, child: &ArrayRef) {
+pub(crate) fn record_execute_slot(slot_idx: usize, parent: &impl TraceArray, child: &ArrayRef) {
     record(TraceEvent::SlotTransition {
         step: "ExecuteSlot",
         slot_idx,
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
     });
 }
 
@@ -728,16 +786,16 @@ pub(crate) fn record_builder_start(array: &ArrayRef) {
     record(TraceEvent::BuilderEvent {
         action: "start",
         subject: "array",
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
-pub(crate) fn record_append_child(slot_idx: usize, parent: &ArrayRef, child: &ArrayRef) {
+pub(crate) fn record_append_child(slot_idx: usize, parent: &impl TraceArray, child: &ArrayRef) {
     record(TraceEvent::SlotTransition {
         step: "AppendChild",
         slot_idx,
-        parent: ArraySummary::new(parent),
-        child: ArraySummary::new(child),
+        parent: parent.trace_summary(),
+        child: child.trace_summary(),
     });
 }
 
@@ -745,13 +803,13 @@ pub(crate) fn record_builder_append(child: &ArrayRef) {
     record(TraceEvent::BuilderEvent {
         action: "append",
         subject: "child",
-        array: ArraySummary::new(child),
+        array: child.trace_summary(),
     });
 }
 
 pub(crate) fn record_execute_done(array: &ArrayRef) {
     record(TraceEvent::ExecuteDone {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
@@ -759,17 +817,17 @@ pub(crate) fn record_builder_finish(output: &ArrayRef) {
     record(TraceEvent::BuilderEvent {
         action: "finish",
         subject: "output",
-        array: ArraySummary::new(output),
+        array: output.trace_summary(),
     });
 }
 
-pub(crate) fn record_single_step_start(array: &ArrayRef) {
+pub(crate) fn record_single_step_start(array: &impl TraceArray) {
     record(TraceEvent::SingleStepStart {
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
-pub(crate) fn record_single_step_phase_none(phase: &'static str, array: &ArrayRef) {
+pub(crate) fn record_single_step_phase_none(phase: &'static str, array: &impl TraceArray) {
     if !attempts_enabled() {
         return;
     }
@@ -777,15 +835,15 @@ pub(crate) fn record_single_step_phase_none(phase: &'static str, array: &ArrayRe
         indent: 1,
         phase,
         subject: "array",
-        array: ArraySummary::new(array),
+        array: array.trace_summary(),
     });
 }
 
 pub(crate) fn record_single_step_applied(phase: &'static str, input: &ArrayRef, output: &ArrayRef) {
     record(TraceEvent::SingleStepApplied {
         phase,
-        input: ArraySummary::new(input),
-        output: ArraySummary::new(output),
+        input: input.trace_summary(),
+        output: output.trace_summary(),
     });
 }
 

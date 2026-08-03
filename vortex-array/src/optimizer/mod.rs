@@ -105,7 +105,7 @@ pub(crate) fn optimize_owned(
                 for (_plugin_idx, plugin) in plugins.as_ref().iter().enumerate() {
                     if let Some(new_array) = plugin(child, &parent_ref, slot_idx)? {
                         trace_op!(record_session_parent_reduce_applied(
-                            &current_array,
+                            &parent_ref,
                             child,
                             slot_idx,
                             _plugin_idx,
@@ -115,7 +115,7 @@ pub(crate) fn optimize_owned(
                         break;
                     }
                     trace_op!(record_session_parent_reduce_declined(
-                        &current_array,
+                        &parent_ref,
                         child,
                         slot_idx,
                         _plugin_idx,
@@ -160,6 +160,8 @@ fn try_optimize_recursive(
     current_array: ArrayRef,
     session: &VortexSession,
 ) -> VortexResult<(ArrayRef, bool)> {
+    trace_op!(record_optimize_recursive_start(&current_array));
+
     let (mut current_array, mut any_optimizations) = optimize_owned(current_array, Some(session))?;
 
     let mut new_slots = SmallVec::with_capacity(current_array.slots().len());
@@ -167,12 +169,15 @@ fn try_optimize_recursive(
     for slot in current_array.slots() {
         match slot {
             Some(child) => {
-                let (new_child, new_slot_optimized) = try_optimize_recursive(child.clone(), session)?;
-                trace_op!(record_optimize_recursive_slot(
-                    new_slots.len(),
-                    child,
-                    &new_child,
-                ));
+                let (new_child, new_slot_optimized) =
+                    try_optimize_recursive(child.clone(), session)?;
+                if new_slot_optimized {
+                    trace_op!(record_optimize_recursive_slot(
+                        new_slots.len(),
+                        child,
+                        &new_child,
+                    ));
+                }
                 new_slots.push(Some(new_child));
                 any_slot_optimized |= new_slot_optimized;
             }
