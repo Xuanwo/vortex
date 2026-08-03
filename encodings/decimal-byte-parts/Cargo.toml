@@ -16,6 +16,11 @@ version = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Lower parts make this encoding write more than one child, which readers that predate them
+# cannot open. Gated until enough readers understand it.
+unstable_encodings = []
+
 [dependencies]
 num-traits = { workspace = true }
 prost = { workspace = true }
@@ -34,3 +39,5 @@ vortex-array = { path = "../../vortex-array", features = ["_test-harness"] }
 [[bench]]
 name = "decimal_assemble"
 harness = false
+# Builds multi-part arrays, which the write gate only permits with this feature.
+required-features = ["unstable_encodings"]

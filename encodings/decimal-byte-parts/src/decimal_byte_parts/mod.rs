@@ -339,18 +339,46 @@ impl DecimalByteParts {
         lower_parts: Vec<ArrayRef>,
         decimal_dtype: DecimalDType,
     ) -> VortexResult<DecimalBytePartsArray> {
-        let len = msp.len();
-        let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
-        let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
-        Array::try_from_parts(
-            ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
-        )
+        // A reader that predates lower parts expects this encoding to have exactly one child,
+        // so a file containing a multi-child array is one it cannot open. Introducing lower
+        // parts is gated behind `unstable_encodings` until enough readers understand them.
+        //
+        // This gate is on *introducing* lower parts only. Reading them back, and rebuilding an
+        // array that already has them, go through `rebuild_with_lower_parts` and stay ungated —
+        // otherwise a build without the feature could not read a file written by one with it.
+        vortex_ensure!(
+            lower_parts.is_empty() || cfg!(feature = "unstable_encodings"),
+            "DecimalByteParts with lower parts requires the `unstable_encodings` feature: \
+             readers that predate lower parts understand only a single child, and would fail \
+             to open a file containing this array"
+        );
+
+        rebuild_with_lower_parts(msp, lower_parts, decimal_dtype)
     }
 }
 
 /// The decimal storage type this array canonicalizes to.
 fn values_type(array: ArrayView<'_, DecimalByteParts>) -> VortexResult<DecimalType> {
     assembled_values_type(array.msp().dtype().as_ptype(), array.lower_parts().len())
+}
+
+/// Build a byte-parts array without the lower-parts write gate.
+///
+/// For rebuilding an array whose lower parts already exist — a compute kernel reshaping one,
+/// or a reader materializing one from a file. Those must keep working regardless of the
+/// feature, because the parts were introduced by whoever wrote the file, not by this call.
+/// Use [`DecimalByteParts::try_new_with_lower_parts`] to introduce lower parts.
+pub(crate) fn rebuild_with_lower_parts(
+    msp: ArrayRef,
+    lower_parts: Vec<ArrayRef>,
+    decimal_dtype: DecimalDType,
+) -> VortexResult<DecimalBytePartsArray> {
+    let len = msp.len();
+    let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
+    let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
+    Array::try_from_parts(
+        ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
+    )
 }
 
 /// The decimal dtype this array carries.
@@ -379,7 +407,7 @@ pub(crate) fn map_parts(
         .iter()
         .map(&mut f)
         .collect::<VortexResult<Vec<_>>>()?;
-    DecimalByteParts::try_new_with_lower_parts(msp, lower_parts, decimal_dtype(array))
+    rebuild_with_lower_parts(msp, lower_parts, decimal_dtype(array))
 }
 
 /// Rebuild the array with a replacement MSP, keeping its lower parts untouched.
@@ -392,7 +420,7 @@ pub(crate) fn with_msp(
     msp: ArrayRef,
     decimal_dtype: DecimalDType,
 ) -> VortexResult<DecimalBytePartsArray> {
-    DecimalByteParts::try_new_with_lower_parts(msp, array.lower_parts().to_vec(), decimal_dtype)
+    rebuild_with_lower_parts(msp, array.lower_parts().to_vec(), decimal_dtype)
 }
 
 /// Converts a DecimalBytePartsArray to its canonical DecimalArray representation.
@@ -735,9 +763,7 @@ mod tests {
         #[case] lower_parts: Vec<ArrayRef>,
         #[case] decimal_dtype: DecimalDType,
     ) {
-        assert!(
-            DecimalByteParts::try_new_with_lower_parts(msp(), lower_parts, decimal_dtype).is_err()
-        );
+        assert!(rebuild_with_lower_parts(msp(), lower_parts, decimal_dtype).is_err());
     }
 
     fn deserialize_with(
@@ -770,6 +796,26 @@ mod tests {
             canonical.buffer::<i128>().as_slice(),
             &[(1i128 << 64) | 1, (2i128 << 64) | 2, (3i128 << 64) | 3]
         );
+        Ok(())
+    }
+
+    /// Reading back an array that already carries lower parts, and computing over it, must
+    /// work regardless of the `unstable_encodings` write gate. The gate stops a writer
+    /// introducing lower parts; if it also blocked the rebuild that every compute kernel does,
+    /// a build without the feature could not read a file written by a build with it.
+    #[test]
+    fn compute_over_existing_lower_parts_is_not_gated() -> VortexResult<()> {
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        // Stands in for an array materialized from a file: the parts already exist.
+        let array = deserialize_with(1, vec![msp(), lower_part()])
+            .and_then(Array::try_from_parts)?
+            .into_array();
+
+        let sliced = array.slice(0..2)?;
+        assert_eq!(sliced.execute::<DecimalArray>(&mut ctx)?.len(), 2);
         Ok(())
     }
 
@@ -818,7 +864,7 @@ mod tests {
         assert_eq!(canonical.values_type(), DecimalType::I256);
 
         // A narrow MSP with a single lower part still fits 128 bits.
-        let array = DecimalByteParts::try_new_with_lower_parts(
+        let array = rebuild_with_lower_parts(
             buffer![1i8, -1, 0].into_array(),
             vec![buffer![7u64, 7, 7].into_array()],
             DecimalDType::new(38, 2),
@@ -831,7 +877,7 @@ mod tests {
         );
 
         // Two lower parts under a narrow MSP overflow 128 bits, so the value widens.
-        let array = DecimalByteParts::try_new_with_lower_parts(
+        let array = rebuild_with_lower_parts(
             buffer![1i8].into_array(),
             vec![buffer![0u64].into_array(), buffer![9u64].into_array()],
             DecimalDType::new(76, 2),
@@ -845,7 +891,7 @@ mod tests {
     #[test]
     fn test_unused_buffer_of_values_is_ignored_for_null_rows() -> VortexResult<()> {
         // Null rows may hold arbitrary bits in the lower parts; they must stay null.
-        let array = DecimalByteParts::try_new_with_lower_parts(
+        let array = rebuild_with_lower_parts(
             PrimitiveArray::new(
                 buffer![0i64, 0, 0],
                 Validity::Array(BoolArray::from_iter([false, false, true]).into_array()),

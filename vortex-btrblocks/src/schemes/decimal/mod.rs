@@ -30,9 +30,11 @@ use crate::SchemeExt;
 /// Narrows the decimal to the smallest integer type, compresses the underlying primitive, and wraps
 /// the result in a `DecimalBytePartsArray`.
 ///
-/// Values that stay wider than 64 bits after narrowing are split into a signed most
-/// significant part and 64-bit lower parts — one for `i128`, three for `i256` — each of
-/// which is compressed independently.
+/// With `unstable_encodings`, values that stay wider than 64 bits after narrowing are split
+/// into a signed most significant part and 64-bit lower parts — one for `i128`, three for
+/// `i256` — each compressed independently. That writes more than one child, which readers
+/// predating lower parts cannot open, so without the feature such values are left
+/// uncompressed instead.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct DecimalScheme;
 
@@ -49,9 +51,13 @@ impl Scheme for DecimalScheme {
         vec![DecimalByteParts.id()]
     }
 
-    /// Children: msp=0, lower parts=1..=3.
+    /// Children: msp=0, and with `unstable_encodings`, lower parts=1..=3.
     fn num_children(&self) -> usize {
-        DecimalBytePartsSlots::FIXED_COUNT + MAX_LOWER_PARTS
+        if cfg!(feature = "unstable_encodings") {
+            DecimalBytePartsSlots::FIXED_COUNT + MAX_LOWER_PARTS
+        } else {
+            DecimalBytePartsSlots::FIXED_COUNT
+        }
     }
 
     fn expected_compression_ratio(
@@ -74,6 +80,13 @@ impl Scheme for DecimalScheme {
         let decimal = data.array().clone().execute::<DecimalArray>(exec_ctx)?;
         let decimal = narrowed_decimal(decimal);
         let parts = split_decimal(&decimal)?;
+
+        // Splitting a value too wide for one signed part writes more than one child, which a
+        // reader predating lower parts cannot open. Until that is stable, leave those values
+        // as the canonical decimal rather than emitting a file such a reader would reject.
+        if !parts.lower_parts.is_empty() && !cfg!(feature = "unstable_encodings") {
+            return Ok(decimal.into_array());
+        }
 
         let msp = compressor.compress_child(
             &parts.msp,

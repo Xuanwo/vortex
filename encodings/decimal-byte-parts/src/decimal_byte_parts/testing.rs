@@ -11,18 +11,18 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::DecimalByteParts;
 use crate::DecimalBytePartsArray;
 use crate::decimal_byte_parts::limbs::split_decimal;
+use crate::decimal_byte_parts::rebuild_with_lower_parts;
 
 /// Encode a canonical decimal array as byte parts, splitting wide values into lower parts.
+///
+/// Goes through [`rebuild_with_lower_parts`] rather than the public constructor so these
+/// helpers exercise the multi-part paths under a default `cargo test`, independent of the
+/// `unstable_encodings` write gate. The gate itself is covered by `tests/lower_parts_gate.rs`.
 pub(crate) fn encode(decimal: &DecimalArray) -> VortexResult<DecimalBytePartsArray> {
     let parts = split_decimal(decimal)?;
-    DecimalByteParts::try_new_with_lower_parts(
-        parts.msp,
-        parts.lower_parts,
-        decimal.decimal_dtype(),
-    )
+    rebuild_with_lower_parts(parts.msp, parts.lower_parts, decimal.decimal_dtype())
 }
 
 /// An `i128`-backed decimal array, encoded as byte parts with one lower part.

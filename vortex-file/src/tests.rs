@@ -11,8 +11,11 @@ use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::pin_mut;
+#[cfg(feature = "unstable_encodings")]
 use rand::RngExt;
+#[cfg(feature = "unstable_encodings")]
 use rand::SeedableRng as _;
+#[cfg(feature = "unstable_encodings")]
 use rand::rngs::StdRng;
 use rstest::rstest;
 use vortex_array::ArrayRef;
@@ -39,6 +42,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::PType::I32;
 use vortex_array::dtype::StructFields;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::dtype::i256;
 use vortex_array::expr::and;
 use vortex_array::expr::cast;
@@ -233,6 +237,10 @@ async fn test_round_trip_many_types() {
 /// End-to-end check that decimals wider than 64 bits survive a write/read round trip and are
 /// actually compressed: the compressor splits them into a most significant part plus 64-bit
 /// lower parts, each of which compresses on its own.
+///
+/// Requires `unstable_encodings`: the split writes more than one child, so without the
+/// feature the compressor deliberately leaves these values canonical and uncompressed.
+#[cfg(feature = "unstable_encodings")]
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
