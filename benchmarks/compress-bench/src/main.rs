@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
@@ -356,7 +357,8 @@ async fn run_benchmark_for_dataset(
                         iterations,
                         bench_name,
                     )
-                    .await?;
+                    .await
+                    .with_context(|| format!("compressing {bench_name} as {format}"))?;
                     compressed_sizes.insert(*format, result.compressed_size);
                     let all_runs_ns: Vec<u64> = result
                         .all_runs
@@ -387,7 +389,8 @@ async fn run_benchmark_for_dataset(
                         iterations,
                         bench_name,
                     )
-                    .await?;
+                    .await
+                    .with_context(|| format!("decompressing {bench_name} as {format}"))?;
                     let all_runs_ns: Vec<u64> = result
                         .all_runs
                         .iter()
