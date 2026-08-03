@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Wrappers around nvcomp's batched ZSTD decompression API.
+//! Wrappers around nvcomp's batched Snappy decompression API.
+//!
+//! Snappy is the default Parquet page codec and is the fastest of the codecs nvcomp
+//! implements on device, which makes it the codec of choice when feeding Parquet pages
+//! to the GPU.
 
 use std::ffi::c_void;
 
@@ -12,22 +16,31 @@ use crate::error::check_status;
 use crate::nvcomp_library;
 use crate::sys;
 
-/// Options for batched ZSTD decompression.
+/// The largest compressed chunk the Snappy decompressor accepts, in bytes.
+pub const MAX_COMPRESSED_CHUNK_SIZE: usize = (1 << 31) - 1;
+
+/// Options for batched Snappy decompression.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ZstdDecompressOpts {
+pub struct SnappyDecompressOpts {
+    /// Which nvcomp backend performs the decompression.
     pub backend: DecompressBackend,
+    /// Sort chunks by size before submitting them to the hardware decompression engine.
+    ///
+    /// Only used when `backend` selects the hardware engine.
+    pub sort_before_hw_decompress: bool,
 }
 
-impl ZstdDecompressOpts {
-    fn to_nvcomp(self) -> sys::nvcompBatchedZstdDecompressOpts_t {
-        sys::nvcompBatchedZstdDecompressOpts_t {
+impl SnappyDecompressOpts {
+    fn to_nvcomp(self) -> sys::nvcompBatchedSnappyDecompressOpts_t {
+        sys::nvcompBatchedSnappyDecompressOpts_t {
             backend: self.backend.to_nvcomp(),
-            reserved: [0; 60],
+            sort_before_hw_decompress: i32::from(self.sort_before_hw_decompress),
+            reserved: [0; 56],
         }
     }
 }
 
-/// Computes required temporary buffer size for batched ZSTD decompression.
+/// Computes required temporary buffer size for batched Snappy decompression.
 ///
 /// # Arguments
 ///
@@ -47,7 +60,7 @@ pub fn get_decompress_temp_size(
         num_chunks,
         max_uncompressed_chunk_bytes,
         max_total_uncompressed_bytes,
-        ZstdDecompressOpts::default(),
+        SnappyDecompressOpts::default(),
     )
 }
 
@@ -67,14 +80,14 @@ pub fn get_decompress_temp_size_with_opts(
     num_chunks: usize,
     max_uncompressed_chunk_bytes: usize,
     max_total_uncompressed_bytes: usize,
-    opts: ZstdDecompressOpts,
+    opts: SnappyDecompressOpts,
 ) -> Result<usize, NvcompError> {
     let library = nvcomp_library()?;
 
     let mut temp_bytes: usize = 0;
 
     let status = unsafe {
-        library.nvcompBatchedZstdDecompressGetTempSizeAsync(
+        library.nvcompBatchedSnappyDecompressGetTempSizeAsync(
             num_chunks,
             max_uncompressed_chunk_bytes,
             opts.to_nvcomp(),
@@ -87,9 +100,9 @@ pub fn get_decompress_temp_size_with_opts(
     Ok(temp_bytes)
 }
 
-/// Returns the minimum buffer alignments required by batched ZSTD decompression.
+/// Returns the minimum buffer alignments required by batched Snappy decompression.
 pub fn decompress_alignment_requirements(
-    opts: ZstdDecompressOpts,
+    opts: SnappyDecompressOpts,
 ) -> Result<AlignmentRequirements, NvcompError> {
     let library = nvcomp_library()?;
 
@@ -100,7 +113,7 @@ pub fn decompress_alignment_requirements(
     };
 
     let status = unsafe {
-        library.nvcompBatchedZstdDecompressGetRequiredAlignments(
+        library.nvcompBatchedSnappyDecompressGetRequiredAlignments(
             opts.to_nvcomp(),
             &raw mut requirements,
         )
@@ -110,10 +123,10 @@ pub fn decompress_alignment_requirements(
     Ok(requirements.into())
 }
 
-/// Launches batched ZSTD decompression asynchronously on the GPU.
+/// Launches batched Snappy decompression asynchronously on the GPU.
 ///
-/// This function decompresses multiple ZSTD-compressed chunks in parallel on the GPU.
-/// All pointer arguments must point to device memory, and the operation is executed
+/// This function decompresses multiple raw Snappy blocks in parallel on the GPU. All
+/// pointer arguments must point to device memory, and the operation is executed
 /// asynchronously on the provided CUDA stream.
 ///
 /// # Arguments
@@ -163,12 +176,12 @@ pub unsafe fn decompress_async(
             device_uncompressed_ptrs,
             device_statuses,
             stream,
-            ZstdDecompressOpts::default(),
+            SnappyDecompressOpts::default(),
         )
     }
 }
 
-/// Launches batched ZSTD decompression asynchronously with custom options.
+/// Launches batched Snappy decompression asynchronously with custom options.
 ///
 /// # Safety
 ///
@@ -185,12 +198,12 @@ pub unsafe fn decompress_async_with_opts(
     device_uncompressed_ptrs: *const *mut c_void,
     device_statuses: *mut sys::nvcompStatus_t,
     stream: sys::cudaStream_t,
-    opts: ZstdDecompressOpts,
+    opts: SnappyDecompressOpts,
 ) -> Result<(), NvcompError> {
     let library = nvcomp_library()?;
 
     let status = unsafe {
-        library.nvcompBatchedZstdDecompressAsync(
+        library.nvcompBatchedSnappyDecompressAsync(
             device_compressed_ptrs,
             device_compressed_bytes,
             device_uncompressed_bytes,

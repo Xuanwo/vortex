@@ -21,12 +21,14 @@ arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+cudarc = { workspace = true, optional = true }
 futures = { workspace = true }
 indicatif = { workspace = true }
 itertools = { workspace = true }
 lance-bench = { path = "../lance-bench", optional = true }
 parquet = { workspace = true }
 regex = { workspace = true }
+snap = { workspace = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
@@ -34,9 +36,14 @@ vortex = { workspace = true }
 vortex-arrow = { workspace = true }
 vortex-bench = { workspace = true }
 vortex-cuda = { workspace = true, optional = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
-cuda = ["dep:tempfile", "dep:vortex-cuda"]
+cuda = ["dep:cudarc", "dep:tempfile", "dep:vortex-cuda"]
 lance = ["dep:lance-bench"]
 unstable_encodings = ["vortex/unstable_encodings", "vortex-cuda?/unstable_encodings"]
 
@@ -45,7 +52,6 @@ name = "compress-bench"
 test = false
 
 [lib]
-test = false
 
 [lints]
 workspace = true

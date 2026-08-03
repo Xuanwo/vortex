@@ -44,6 +44,16 @@ jobs:
           cargo build --locked --package compress-bench --profile release_debug --features cuda,unstable_encodings
       - name: Setup benchmark environment
         run: sudo bash scripts/setup-benchmark.sh
+      - name: Verify GPU decompression correctness
+        shell: bash
+        env:
+          RUST_BACKTRACE: full
+          FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
+        # Cross-checks every GPU-decompressed page and field against the CPU decoders before
+        # any timings are taken. Verification runs inline, so this pass is not timed.
+        run: |
+          target/release_debug/compress-bench \
+            --gpu-decompress --gpu-verify --iterations 1 -d table
       - name: Run GPU compression benchmark
         shell: bash
         env:

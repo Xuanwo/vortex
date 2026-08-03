@@ -8,9 +8,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use anyhow::ensure;
+use arrow_schema::Field;
 use async_trait::async_trait;
 use futures::StreamExt;
 use tempfile::NamedTempFile;
+use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::struct_::StructArrayExt;
@@ -18,10 +22,12 @@ use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
+use vortex_arrow::ArrowSessionExt;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
 use vortex_bench::conversions::parquet_to_vortex_chunks;
+use vortex_cuda::CanonicalCudaExt;
 use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
 #[cfg(target_os = "linux")]
@@ -31,7 +37,20 @@ use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
 
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
-pub struct GpuVortexCompressor;
+pub struct GpuVortexCompressor {
+    verify: bool,
+}
+
+impl GpuVortexCompressor {
+    /// Create the backend.
+    ///
+    /// When `verify` is set, each GPU-decoded field is copied back to the host and compared
+    /// against the same field decoded on the CPU. Verification runs inline, so timings from a
+    /// verifying run are not comparable to a plain one.
+    pub fn new(verify: bool) -> Self {
+        Self { verify }
+    }
+}
 
 #[async_trait]
 impl Compressor for GpuVortexCompressor {
@@ -75,11 +94,35 @@ impl Compressor for GpuVortexCompressor {
         while let Some(batch) = batches.next().await {
             let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
             for field in record.iter_unmasked_fields() {
-                black_box(field.clone().execute_cuda(&mut cuda_ctx).await?);
+                let decoded = field.clone().execute_cuda(&mut cuda_ctx).await?;
+                if self.verify {
+                    let host = decoded.into_host().await?.into_array();
+                    verify_field(field, host, cuda_ctx.execution_ctx())?;
+                } else {
+                    black_box(decoded);
+                }
             }
         }
         cuda_ctx.synchronize_stream()?;
 
         Ok(start.elapsed())
     }
+}
+
+/// Fails unless a GPU-decoded field matches the same field decoded on the CPU.
+fn verify_field(compressed: &ArrayRef, gpu: ArrayRef, ctx: &mut ExecutionCtx) -> Result<()> {
+    let expected = SESSION
+        .arrow()
+        .execute_arrow(compressed.clone(), None, ctx)?;
+    // Pin the Arrow target type so the two sides cannot land on different but equivalent
+    // encodings of the same logical values.
+    let target = Field::new("", expected.data_type().clone(), gpu.dtype().is_nullable());
+    let actual = SESSION.arrow().execute_arrow(gpu, Some(&target), ctx)?;
+
+    ensure!(
+        expected.to_data() == actual.to_data(),
+        "GPU decode of a {} field does not match the CPU decode",
+        compressed.encoding_id()
+    );
+    Ok(())
 }

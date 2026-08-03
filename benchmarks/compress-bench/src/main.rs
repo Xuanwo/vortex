@@ -8,8 +8,11 @@ use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
 #[cfg(feature = "cuda")]
+use compress_bench::gpu_parquet::GpuParquetCompressor;
+#[cfg(feature = "cuda")]
 use compress_bench::gpu_vortex::GpuVortexCompressor;
 use compress_bench::parquet::ParquetCompressor;
+use compress_bench::parquet_pages::GpuCodec;
 use compress_bench::vortex::VortexCompressor;
 use indicatif::ProgressBar;
 use itertools::Itertools;
@@ -35,6 +38,7 @@ use vortex_bench::display::DisplayFormat;
 use vortex_bench::display::print_measurements_json;
 use vortex_bench::display::render_table;
 use vortex_bench::downloadable_dataset::DownloadableDataset;
+use vortex_bench::measurements::CustomUnitMeasurement;
 use vortex_bench::public_bi::PBI_DATASETS;
 use vortex_bench::public_bi::PBIDataset::Arade;
 use vortex_bench::public_bi::PBIDataset::Bimbo;
@@ -67,11 +71,23 @@ struct Args {
     ops: Vec<CompressOp>,
     #[arg(long)]
     datasets: Option<String>,
-    /// Run GPU decompression for the allow-listed benchmarks.
+    /// Run GPU decompression for the GPU-supported benchmarks.
     ///
-    /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
+    /// Restricts the suite to datasets with verified CUDA decode support and measures
+    /// decompression only, for both Vortex and Parquet.
     #[arg(long)]
     gpu_decompress: bool,
+    /// Page codec the GPU Parquet backend writes and decompresses with.
+    ///
+    /// Snappy is the Parquet default and the codec nvCOMP decompresses fastest.
+    #[arg(long, value_enum, default_value_t)]
+    gpu_parquet_codec: GpuCodec,
+    /// Cross-check every GPU-decompressed result against the CPU decoder.
+    ///
+    /// Verification runs inline, so timings from a verifying run are not comparable to a
+    /// plain one. Intended to be run as its own pass.
+    #[arg(long)]
+    gpu_verify: bool,
     #[arg(short, long, default_value_t, value_enum)]
     display_format: DisplayFormat,
     #[arg(short, long)]
@@ -97,8 +113,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--gpu-decompress requires building compress-bench with --features cuda");
     }
 
-    let (formats, ops) = if args.gpu_decompress {
-        (vec![Format::OnDiskVortex], vec![CompressOp::Decompress])
+    let gpu = args.gpu_decompress.then_some(GpuOptions {
+        codec: args.gpu_parquet_codec,
+        verify: args.gpu_verify,
+    });
+
+    let (formats, ops) = if gpu.is_some() {
+        (
+            vec![Format::Parquet, Format::OnDiskVortex],
+            vec![CompressOp::Decompress],
+        )
     } else {
         (args.formats, args.ops)
     };
@@ -108,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         args.datasets.map(|d| Regex::new(&d)).transpose()?,
         formats,
         ops,
-        args.gpu_decompress,
+        gpu,
         args.display_format,
         args.output_path,
         args.ingest_output,
@@ -116,15 +140,35 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
+/// Settings for the GPU decompression mode.
+#[derive(Clone, Copy, Debug)]
+struct GpuOptions {
+    /// Parquet page codec to write and decompress on the device.
+    codec: GpuCodec,
+    /// Cross-check decompressed output against the CPU decoders.
+    #[cfg_attr(
+        not(feature = "cuda"),
+        expect(dead_code, reason = "only the CUDA backends read this")
+    )]
+    verify: bool,
+}
+
 /// Get a compressor for the given format.
-fn get_compressor(format: Format, gpu_decompress: bool) -> Box<dyn Compressor> {
-    if gpu_decompress {
+fn get_compressor(format: Format, gpu: Option<GpuOptions>) -> Box<dyn Compressor> {
+    if let Some(gpu) = gpu {
         #[cfg(feature = "cuda")]
-        {
-            return Box::new(GpuVortexCompressor);
-        }
+        return match format {
+            Format::OnDiskVortex => {
+                Box::new(GpuVortexCompressor::new(gpu.verify)) as Box<dyn Compressor>
+            }
+            Format::Parquet => Box::new(GpuParquetCompressor::new(gpu.codec, gpu.verify)),
+            _ => unimplemented!("GPU compress bench not implemented for {format}"),
+        };
         #[cfg(not(feature = "cuda"))]
-        unreachable!("GPU feature validation happens before selecting compressors");
+        {
+            let _ = gpu;
+            unreachable!("GPU feature validation happens before selecting compressors");
+        }
     }
 
     match format {
@@ -151,7 +195,7 @@ async fn run_compress(
     datasets_filter: Option<Regex>,
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
-    gpu_decompress: bool,
+    gpu: Option<GpuOptions>,
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     ingest_output: Option<PathBuf>,
@@ -178,15 +222,26 @@ async fn run_compress(
         // ),
     ];
 
-    // Add an existing benchmark name here only after its CUDA-compatible compression and
-    // decompression kernels have been verified end to end.
-    #[expect(
-        clippy::useless_vec,
-        reason = "this is an intentionally incremental allow-list of benchmark names"
-    )]
-    let gpu_decompress_benchmarks = vec!["TPC-H l_comment canonical"];
+    // Datasets run in GPU mode. Add one only after its CUDA-compatible compression and
+    // decompression kernels have been verified end to end with `--gpu-verify`. Between them
+    // these cover FSST strings, ALP and bit-packed numerics, run-end and date/time-parts
+    // encodings, and columns with nulls.
+    //
+    // `StructListOfInts` is deliberately absent: its list layouts have no verified CUDA
+    // decode path yet.
+    let gpu_datasets: [&dyn Dataset; 9] = [
+        &TPCHLCommentCanonical as &dyn Dataset,
+        &TPCHLCommentChunked,
+        &TaxiData,
+        PBI_DATASETS.get(Arade),
+        PBI_DATASETS.get(Bimbo),
+        PBI_DATASETS.get(CMSprovider),
+        PBI_DATASETS.get(Euro2016),
+        PBI_DATASETS.get(Food),
+        PBI_DATASETS.get(HashTags),
+    ];
 
-    let datasets: Vec<&dyn Dataset> = [
+    let all_datasets: Vec<&dyn Dataset> = [
         &TaxiData as &dyn Dataset,
         PBI_DATASETS.get(Arade),
         PBI_DATASETS.get(Bimbo),
@@ -206,10 +261,15 @@ async fn run_compress(
     ]
     .into_iter()
     .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
+    .collect();
+
+    let datasets: Vec<&dyn Dataset> = if gpu.is_some() {
+        gpu_datasets.to_vec()
+    } else {
+        all_datasets
+    }
+    .into_iter()
     .filter(|d| {
-        if gpu_decompress && !gpu_decompress_benchmarks.contains(&d.name()) {
-            return false;
-        }
         if let Some(filter) = datasets_filter.as_ref() {
             filter.is_match(d.name())
         } else {
@@ -226,15 +286,9 @@ async fn run_compress(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for dataset_handle in datasets.into_iter() {
-        let (m, mut records) = run_benchmark_for_dataset(
-            &progress,
-            &formats,
-            &ops,
-            iterations,
-            dataset_handle,
-            gpu_decompress,
-        )
-        .await?;
+        let (m, mut records) =
+            run_benchmark_for_dataset(&progress, &formats, &ops, iterations, dataset_handle, gpu)
+                .await?;
         measurements.push(m);
         v3_records.append(&mut records);
     }
@@ -275,7 +329,7 @@ async fn run_benchmark_for_dataset(
     ops: &[CompressOp],
     iterations: usize,
     dataset_handle: &dyn Dataset,
-    gpu_decompress: bool,
+    gpu: Option<GpuOptions>,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
@@ -291,7 +345,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu_decompress);
+        let compressor = get_compressor(*format, gpu);
 
         for op in ops {
             let time = match op {
@@ -342,7 +396,7 @@ async fn run_benchmark_for_dataset(
                     v3_records.push(v3::compression_time_record(
                         &result.timing,
                         v3_dataset,
-                        if gpu_decompress {
+                        if gpu.is_some() {
                             Some("gpu")
                         } else {
                             v3_variant
@@ -361,12 +415,42 @@ async fn run_benchmark_for_dataset(
     }
 
     // Calculate cross-format ratios after all measurements.
-    calculate_ratios(
-        &measurements_map,
-        &compressed_sizes,
-        bench_name,
-        &mut ratios,
-    );
+    match gpu {
+        // The shared ratio labels name the CPU suite's codec, which the GPU run does not
+        // necessarily use, so GPU mode emits its own correctly-labelled ratio.
+        Some(gpu) => push_gpu_ratio(&measurements_map, gpu, bench_name, &mut ratios),
+        None => calculate_ratios(
+            &measurements_map,
+            &compressed_sizes,
+            bench_name,
+            &mut ratios,
+        ),
+    }
 
     Ok((CompressMeasurements { timings, ratios }, v3_records))
+}
+
+/// Emit the Vortex-versus-Parquet decompression ratio for a GPU run.
+fn push_gpu_ratio(
+    measurements: &HashMap<(Format, CompressOp), Duration>,
+    gpu: GpuOptions,
+    bench_name: &str,
+    ratios: &mut Vec<CustomUnitMeasurement>,
+) {
+    let (Some(vortex_time), Some(parquet_time)) = (
+        measurements.get(&(Format::OnDiskVortex, CompressOp::Decompress)),
+        measurements.get(&(Format::Parquet, CompressOp::Decompress)),
+    ) else {
+        return;
+    };
+
+    ratios.push(CustomUnitMeasurement {
+        name: format!(
+            "vortex:parquet-{} gpu ratio decompress time/{bench_name}",
+            gpu.codec.name()
+        ),
+        format: Format::OnDiskVortex,
+        unit: std::borrow::Cow::from("ratio"),
+        value: vortex_time.as_nanos() as f64 / parquet_time.as_nanos() as f64,
+    });
 }
