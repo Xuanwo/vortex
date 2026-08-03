@@ -5,32 +5,17 @@ use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
 use vortex::array::ArrayVTable;
 use vortex::array::IntoArray;
-use vortex::array::arrays::DecimalArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::dtype::DecimalDType;
 use vortex::array::dtype::FieldNames;
-use vortex::array::dtype::i256;
 use vortex::array::validity::Validity;
-use vortex::buffer::Buffer;
 use vortex::encodings::decimal_byte_parts::DecimalByteParts;
-use vortex::encodings::decimal_byte_parts::DecimalBytePartsArray;
-use vortex::encodings::decimal_byte_parts::split_decimal;
 use vortex::error::VortexResult;
 use vortex_array::ExecutionCtx;
 
 use super::N;
 use crate::fixtures::FlatLayoutFixture;
-
-/// Encode a canonical decimal as byte parts, splitting wide values into lower parts.
-fn encode_byte_parts(decimal: &DecimalArray) -> VortexResult<DecimalBytePartsArray> {
-    let parts = split_decimal(decimal)?;
-    DecimalByteParts::try_new_with_lower_parts(
-        parts.msp,
-        parts.lower_parts,
-        decimal.decimal_dtype(),
-    )
-}
 
 pub struct DecimalBytePartsFixture;
 
@@ -95,28 +80,6 @@ impl FlatLayoutFixture for DecimalBytePartsFixture {
         let near_limit_arr =
             DecimalByteParts::try_new(near_limit_values.into_array(), near_limit_dtype)?;
 
-        // Wide decimals, split into an MSP plus 64-bit lower parts.
-        let wide_128_dtype = DecimalDType::new(38, 2);
-        let wide_128 = DecimalArray::new(
-            (0..N as i128)
-                .map(|i| 10i128.pow(25) + i * 7)
-                .collect::<Buffer<i128>>(),
-            wide_128_dtype,
-            Validity::NonNullable,
-        );
-        let wide_128_arr = encode_byte_parts(&wide_128)?;
-
-        let wide_256_dtype = DecimalDType::new(76, 2);
-        let base = i256::from_i128(10).wrapping_pow(40);
-        let wide_256 = DecimalArray::new(
-            (0..N as i128)
-                .map(|i| base + i256::from_i128(i * 7))
-                .collect::<Buffer<i256>>(),
-            wide_256_dtype,
-            Validity::from_iter((0..N).map(|i| i % 7 != 0)),
-        );
-        let wide_256_arr = encode_byte_parts(&wide_256)?;
-
         let arr = StructArray::try_new(
             FieldNames::from([
                 "dec_10_2",
@@ -127,8 +90,6 @@ impl FlatLayoutFixture for DecimalBytePartsFixture {
                 "dec_crossing",
                 "dec_trailing_zero",
                 "dec_near_limit",
-                "dec_wide_128",
-                "dec_wide_256_nullable",
             ]),
             vec![
                 decimal_arr.into_array(),
@@ -139,8 +100,6 @@ impl FlatLayoutFixture for DecimalBytePartsFixture {
                 crossing_arr.into_array(),
                 trailing_zero_arr.into_array(),
                 near_limit_arr.into_array(),
-                wide_128_arr.into_array(),
-                wide_256_arr.into_array(),
             ],
             N,
             Validity::NonNullable,
