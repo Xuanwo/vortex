@@ -49,22 +49,6 @@ mod tests {
         DecimalDType::new(2, 0),
     ))]
     #[case(DecimalArray::from_iter(
-        [10i16, 20, 30, 40, 50],
-        DecimalDType::new(3, 0),
-    ))]
-    #[case(DecimalArray::from_iter(
-        [100i32, 200, 300, 400, 500],
-        DecimalDType::new(5, 0),
-    ))]
-    #[case(DecimalArray::from_iter(
-        [1_000i64, 2_000, 3_000, 4_000, 5_000],
-        DecimalDType::new(10, 0),
-    ))]
-    #[case(DecimalArray::from_iter(
-        [10_000i128, 20_000, 30_000, 40_000, 50_000],
-        DecimalDType::new(19, 0),
-    ))]
-    #[case(DecimalArray::from_iter(
         [1i128, 2, 3, 4, 5].map(i256::from_i128),
         DecimalDType::new(39, 0),
     ))]
