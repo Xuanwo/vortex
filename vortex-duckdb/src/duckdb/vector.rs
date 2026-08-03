@@ -112,12 +112,6 @@ impl VectorRef {
         }
     }
 
-    // Used to by duckdb to know the dictionary value length (since each vector doesn't know its own
-    // length only its capacity).
-    pub fn set_dictionary_len(&mut self, len: u32) {
-        unsafe { cpp::duckdb_vx_set_dictionary_vector_length(self.as_ptr(), len) }
-    }
-
     pub fn to_sequence(&mut self, start: i64, stop: i64, capacity: u64) {
         unsafe { cpp::duckdb_vx_sequence_vector(self.as_ptr(), start, stop, capacity) }
     }
@@ -165,11 +159,6 @@ impl VectorRef {
         unsafe {
             cpp::duckdb_vx_string_vector_add_vector_data_buffer(self.as_ptr(), buffer.as_ptr())
         }
-    }
-
-    /// Sets the data pointer for the vector. This is the start of the values array in the vector.
-    pub unsafe fn set_data_ptr<T>(&mut self, ptr: *mut T) {
-        unsafe { cpp::duckdb_vx_vector_set_data_ptr(self.as_ptr(), ptr as *mut c_void) }
     }
 
     /// Sets the validity data for the vector from a [`ValidityData`]. The buffer is
