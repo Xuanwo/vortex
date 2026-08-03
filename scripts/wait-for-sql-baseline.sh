@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
 # Wait for successful SQL benchmark results for the pull request base commit.
 set -Eeuo pipefail
 
