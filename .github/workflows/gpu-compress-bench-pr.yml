@@ -45,15 +45,53 @@ jobs:
       - name: Setup benchmark environment
         run: sudo bash scripts/setup-benchmark.sh
       - name: Verify GPU decompression correctness
+        id: verify
         shell: bash
+        continue-on-error: true
         env:
-          RUST_BACKTRACE: full
+          RUST_BACKTRACE: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         # Cross-checks every GPU-decompressed page and field against the CPU decoders before
-        # any timings are taken. Verification runs inline, so this pass is not timed.
+        # any timings are taken. Verification runs inline, so this pass is not timed. It runs
+        # every dataset rather than stopping at the first failure, so one run reports the whole
+        # matrix; the gate step below still fails the job.
         run: |
+          set -o pipefail
           target/release_debug/compress-bench \
-            --gpu-decompress --gpu-verify --iterations 1 -d table
+            --gpu-decompress --gpu-verify --iterations 1 -d table 2>&1 | tee gpu-verify.txt
+      - name: Publish verification result
+        shell: bash
+        # The per-dataset verdicts are worth surfacing on the PR whether or not they all pass:
+        # digging them out of a multi-thousand-line job log is otherwise the only way to see
+        # which encodings decode correctly on the GPU.
+        run: |
+          {
+            echo "# GPU decompression verification"
+            echo
+            if [ "${{ steps.verify.outcome }}" = "success" ]; then
+              echo "All GPU datasets matched the CPU decode."
+            else
+              echo "Verification failed. Per-dataset results:"
+            fi
+            echo
+            echo '```text'
+            grep -E "verified [0-9]+|GPU verification failed|^  - " gpu-verify.txt | tail -40 \
+              || tail -40 gpu-verify.txt
+            echo '```'
+          } > verify-comment.md
+          cat verify-comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment PR with verification result
+        if: github.event.pull_request.head.repo.fork == false
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          file-path: verify-comment.md
+          comment-tag: bench-pr-comment-gpu-verify
+      - name: Fail if verification failed
+        if: steps.verify.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "GPU decompression verification failed; see the verification comment." >&2
+          exit 1
       - name: Run GPU compression benchmark
         shell: bash
         env:
