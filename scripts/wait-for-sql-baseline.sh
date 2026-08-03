@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+# Wait for successful SQL benchmark results for the pull request base commit.
+set -Eeuo pipefail
+
+for attempt in {1..40}; do
+  runs="$(
+    gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" \
+      -f head_sha="$BASELINE_COMMIT" \
+      -f event=push \
+      -f per_page=100
+  )"
+  run_id="$(
+    jq -r '
+      [.workflow_runs[]
+        | select(
+            .path == ".github/workflows/bench.yml"
+            or .path == ".github/workflows/develop-bench.yml"
+          )]
+      | max_by(.id)
+      | .id // empty
+    ' <<< "$runs"
+  )"
+
+  if [[ -n "$run_id" ]]; then
+    run_status="$(jq -r --argjson run_id "$run_id" '
+      .workflow_runs[]
+      | select(.id == $run_id)
+      | .status
+    ' <<< "$runs")"
+
+    if [[ "$run_status" == "completed" ]]; then
+      jobs="$(
+        gh api --method GET \
+          "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
+          -f filter=latest \
+          -f per_page=100
+      )"
+      sql_jobs="$(jq '[.jobs[] | select(.name | startswith("sql / bench ("))]' <<< "$jobs")"
+      failed_jobs="$(jq '[.[] | select(.conclusion != "success")] | length' <<< "$sql_jobs")"
+
+      if (( failed_jobs == 0 )) && (( $(jq length <<< "$sql_jobs") > 0 )); then
+        echo "SQL baselines are ready for $BASELINE_COMMIT"
+        exit 0
+      fi
+
+      echo "SQL benchmarks failed for base commit $BASELINE_COMMIT:" >&2
+      jq -r '.[] | select(.conclusion != "success") | "  \(.name): \(.conclusion)"' \
+        <<< "$sql_jobs" >&2
+      exit 1
+    fi
+  fi
+
+  if (( attempt == 40 )); then
+    echo "Timed out waiting for SQL baselines from $BASELINE_COMMIT" >&2
+    exit 1
+  fi
+
+  echo "Waiting for SQL benchmarks from base commit $BASELINE_COMMIT"
+  sleep 60
+done
