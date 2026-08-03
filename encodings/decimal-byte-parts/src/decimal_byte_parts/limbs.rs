@@ -176,6 +176,54 @@ pub(crate) fn combine_i128(msp: i64, lower: impl IntoIterator<Item = u64>) -> i1
     })
 }
 
+/// 64-bit words in an `i256`.
+const VALUE_WORDS: usize = 4;
+
+/// The 64-bit words of an `i256`, ascending significance.
+///
+/// An `i256` is exactly `{_0: u64, _1: u64, _2: u64, _3: i64}` — three unsigned words beneath
+/// a single signed one — which is the same shape this encoding stores. That is why splitting
+/// and reassembling are pure reinterpretation rather than arithmetic: no carry ever crosses a
+/// word boundary, so each word can be compressed independently and put back verbatim.
+///
+/// The sign lives in the most significant word alone. When the most significant part is
+/// narrower than 64 bits, or sits below word 3, the words above it are its sign extension.
+type ValueWords = [u64; VALUE_WORDS];
+
+/// Reinterpret an `i256` as its 64-bit words.
+#[inline]
+const fn i256_to_words(value: i256) -> ValueWords {
+    let (low, high) = value.to_parts();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each cast takes the low 64 bits of a word pair by construction"
+    )]
+    [
+        low as u64,
+        (low >> LOWER_PART_BITS) as u64,
+        high as u64,
+        (high >> LOWER_PART_BITS) as u64,
+    ]
+}
+
+/// Reinterpret 64-bit words as an `i256`, with the most significant word carrying the sign.
+#[inline]
+const fn i256_from_words(words: ValueWords) -> i256 {
+    i256::from_parts(
+        (words[0] as u128) | ((words[1] as u128) << LOWER_PART_BITS),
+        ((words[2] as u128) | ((words[3] as u128) << LOWER_PART_BITS)) as i128,
+    )
+}
+
+/// The words of a value whose most significant part sits at `msp_word`, with every word above
+/// it filled with the MSP's sign.
+#[inline]
+fn sign_extended_words(msp: i64, msp_word: usize) -> ValueWords {
+    let mut words = [if msp < 0 { u64::MAX } else { 0 }; VALUE_WORDS];
+    words[msp_word] = msp.cast_unsigned();
+    words
+}
+
 /// Combine a single row's parts into an `i256`.
 ///
 /// The lower parts fill the least significant 64-bit words, the MSP the word above them,
@@ -183,16 +231,11 @@ pub(crate) fn combine_i128(msp: i64, lower: impl IntoIterator<Item = u64>) -> i1
 #[inline]
 pub(crate) fn combine_i256(msp: i64, lower: impl ExactSizeIterator<Item = u64>) -> i256 {
     let count = lower.len();
-    let mut words = [if msp < 0 { u64::MAX } else { 0 }; 4];
+    let mut words = sign_extended_words(msp, count);
     for (i, part) in lower.enumerate() {
         words[count - 1 - i] = part;
     }
-    words[count] = msp.cast_unsigned();
-
-    i256::from_parts(
-        u128::from(words[0]) | (u128::from(words[1]) << LOWER_PART_BITS),
-        (u128::from(words[2]) | (u128::from(words[3]) << LOWER_PART_BITS)).cast_signed(),
-    )
+    i256_from_words(words)
 }
 
 impl DecimalParts {
@@ -234,23 +277,22 @@ fn split_i128(values: &Buffer<i128>) -> (Buffer<i64>, Buffer<u64>) {
     (msp.freeze(), lower.freeze())
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "splitting a wide integer into 64-bit windows truncates by construction"
-)]
+/// The inverse of [`assemble_i256`] at `K == MAX_LOWER_PARTS`: word 3 becomes the signed MSP,
+/// and words 2, 1, 0 become the lower parts, most significant first.
 fn split_i256(values: &Buffer<i256>) -> (Buffer<i64>, [Buffer<u64>; MAX_LOWER_PARTS]) {
     let mut msp = BufferMut::<i64>::with_capacity(values.len());
-    // Ordered most significant first: bits 191..128, 127..64, 63..0.
     let mut lower = std::array::from_fn::<_, MAX_LOWER_PARTS, _>(|_| {
         BufferMut::<u64>::with_capacity(values.len())
     });
     for value in values.iter() {
-        let (low, high) = value.to_parts();
-        msp.push((high >> LOWER_PART_BITS) as i64);
-        lower[0].push(high as u64);
-        lower[1].push((low >> LOWER_PART_BITS) as u64);
-        lower[2].push(low as u64);
+        let words = i256_to_words(*value);
+        msp.push(words[MAX_LOWER_PARTS].cast_signed());
+        for (part, word) in lower
+            .iter_mut()
+            .zip(words.iter().take(MAX_LOWER_PARTS).rev())
+        {
+            part.push(*word);
+        }
     }
     (msp.freeze(), lower.map(BufferMut::freeze))
 }
@@ -293,16 +335,13 @@ fn assemble_i256<const K: usize>(msp: &PrimitiveArray, lower: [&[u64]; K]) -> Bu
     let mut out = BufferMut::<i256>::with_capacity(msp.len());
     match_each_signed_integer_ptype!(msp.ptype(), |P| {
         for (row, value) in msp.as_slice::<P>().iter().enumerate() {
-            let value = i64::from(*value);
-            let mut words = [if value < 0 { u64::MAX } else { 0 }; 4];
+            // The MSP occupies word `K`, the lower parts the `K` words beneath it most
+            // significant first, and anything above word `K` is the MSP's sign.
+            let mut words = sign_extended_words(i64::from(*value), K);
             for (i, part) in lower.iter().enumerate() {
                 words[K - 1 - i] = part[row];
             }
-            words[K] = value.cast_unsigned();
-            out.push(i256::from_parts(
-                u128::from(words[0]) | (u128::from(words[1]) << LOWER_PART_BITS),
-                (u128::from(words[2]) | (u128::from(words[3]) << LOWER_PART_BITS)).cast_signed(),
-            ));
+            out.push(i256_from_words(words));
         }
     });
     out.freeze()
