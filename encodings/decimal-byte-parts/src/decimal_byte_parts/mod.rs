@@ -152,6 +152,18 @@ impl VTable for DecimalByteParts {
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
+        // The last gate before bytes reach a file. Constructing lower parts is already gated,
+        // but an array read from a file can be handed straight back to a writer without going
+        // through a constructor or the compressor, and the write allow-list only checks the
+        // encoding id, not how many children it carries. Without this a build lacking the
+        // feature could still emit a multi-child array it never could have built.
+        vortex_ensure!(
+            array.lower_parts().is_empty() || cfg!(feature = "unstable_encodings"),
+            "serializing DecimalByteParts with lower parts requires the `unstable_encodings` \
+             feature: readers that predate lower parts understand only a single child, and \
+             would fail to open a file containing this array"
+        );
+
         let lower_part_count = u32::try_from(array.lower_parts().len())
             .map_err(|_| vortex_err!("lower part count exceeds u32"))?;
         Ok(Some(
@@ -692,15 +704,29 @@ mod tests {
         Ok(())
     }
 
+    /// Serializing lower parts is gated: an array carrying them can only be written to bytes
+    /// with `unstable_encodings`, so these cases only exist when the feature is on.
+    #[cfg(feature = "unstable_encodings")]
+    #[rstest]
+    #[case::one_lower_part(i128_parts(wide_i128_values(), Validity::NonNullable))]
+    #[case::three_lower_parts(i256_parts(wide_i256_values(), Validity::NonNullable))]
+    #[case::nullable_three_lower_parts(i256_parts(wide_i256_values(), Validity::AllValid))]
+    fn test_serde_round_trip_with_lower_parts(
+        #[case] array: DecimalBytePartsArray,
+    ) -> VortexResult<()> {
+        test_serde_round_trip(array)
+    }
+
     #[rstest]
     #[case::no_lower_parts(
         encode(&DecimalArray::new(buffer![1i32, 2, 3], DecimalDType::new(9, 2), Validity::NonNullable))
             .vortex_expect("valid decimal byte parts")
     )]
-    #[case::one_lower_part(i128_parts(wide_i128_values(), Validity::NonNullable))]
-    #[case::three_lower_parts(i256_parts(wide_i256_values(), Validity::NonNullable))]
-    #[case::nullable_three_lower_parts(i256_parts(wide_i256_values(), Validity::AllValid))]
-    fn test_serde_round_trip(#[case] array: DecimalBytePartsArray) -> VortexResult<()> {
+    fn test_serde_round_trip_flat(#[case] array: DecimalBytePartsArray) -> VortexResult<()> {
+        test_serde_round_trip(array)
+    }
+
+    fn test_serde_round_trip(array: DecimalBytePartsArray) -> VortexResult<()> {
         let session = array_session();
         session.arrays().register(DecimalByteParts);
 
@@ -795,6 +821,33 @@ mod tests {
         assert_eq!(
             canonical.buffer::<i128>().as_slice(),
             &[(1i128 << 64) | 1, (2i128 << 64) | 2, (3i128 << 64) | 3]
+        );
+        Ok(())
+    }
+
+    /// An array read from a file can be handed straight back to a writer, bypassing both the
+    /// constructor and the compressor. Without the feature that write must be refused, or a
+    /// build that could never have built this array could still emit one.
+    #[cfg(not(feature = "unstable_encodings"))]
+    #[test]
+    fn serializing_read_lower_parts_is_gated() -> VortexResult<()> {
+        let session = array_session();
+        session.arrays().register(DecimalByteParts);
+
+        let array = deserialize_with(1, vec![msp(), lower_part()])
+            .and_then(Array::try_from_parts)?
+            .into_array();
+
+        let err = array
+            .serialize(
+                &ArrayContext::empty(),
+                &session,
+                &SerializeOptions::default(),
+            )
+            .expect_err("expected the write gate to refuse");
+        assert!(
+            err.to_string().contains("unstable_encodings"),
+            "error should name the feature, got: {err}"
         );
         Ok(())
     }
