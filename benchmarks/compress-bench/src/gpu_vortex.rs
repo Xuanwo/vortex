@@ -8,6 +8,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use anyhow::bail;
 use anyhow::ensure;
 use arrow_schema::Field;
 use async_trait::async_trait;
@@ -80,27 +81,19 @@ impl Compressor for GpuVortexCompressor {
         output.sync_all().await?;
         drop(output);
 
+        if self.verify {
+            return verify_against_host_scan(gpu_file.path()).await;
+        }
+
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
-        let open_options = SESSION.open_options().with_cuda();
-        // Direct IO keeps repeated iterations measuring storage bandwidth rather than
-        // page-cache hits. It is only available on Linux.
-        #[cfg(target_os = "linux")]
-        let open_options =
-            open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io());
-        let file = open_options.open_path(gpu_file.path()).await?;
+        let file = open_gpu(gpu_file.path()).await?;
         let mut batches = file.scan()?.into_array_stream()?;
 
         while let Some(batch) = batches.next().await {
             let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
             for field in record.iter_unmasked_fields() {
-                let decoded = field.clone().execute_cuda(&mut cuda_ctx).await?;
-                if self.verify {
-                    let host = decoded.into_host().await?.into_array();
-                    verify_field(field, host, cuda_ctx.execution_ctx())?;
-                } else {
-                    black_box(decoded);
-                }
+                black_box(field.clone().execute_cuda(&mut cuda_ctx).await?);
             }
         }
         cuda_ctx.synchronize_stream()?;
@@ -109,11 +102,81 @@ impl Compressor for GpuVortexCompressor {
     }
 }
 
+/// Opens a Vortex file for CUDA execution.
+///
+/// On Linux direct IO keeps repeated iterations measuring storage bandwidth rather than
+/// page-cache hits.
+async fn open_gpu(path: &Path) -> Result<vortex::file::VortexFile> {
+    let open_options = SESSION.open_options().with_cuda();
+    #[cfg(target_os = "linux")]
+    let open_options =
+        open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io());
+    Ok(open_options.open_path(path).await?)
+}
+
+/// Decodes the same file on the GPU and on the CPU and fails on the first difference.
+///
+/// The CPU reference comes from a second, host-only scan rather than from re-decoding the
+/// GPU scan's arrays: a CUDA scan hands back arrays whose buffers live in device memory,
+/// which the host decoders cannot read.
+///
+/// Verification runs inline, so the returned duration is not comparable to a plain run.
+async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
+    let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
+    let start = Instant::now();
+
+    let gpu_file = open_gpu(path).await?;
+    let mut gpu_batches = gpu_file.scan()?.into_array_stream()?;
+    let host_file = SESSION.open_options().open_path(path).await?;
+    let mut host_batches = host_file.scan()?.into_array_stream()?;
+
+    let mut fields_checked = 0usize;
+    loop {
+        let (gpu_batch, host_batch) = (gpu_batches.next().await, host_batches.next().await);
+        let (gpu_batch, host_batch) = match (gpu_batch, host_batch) {
+            (Some(gpu_batch), Some(host_batch)) => (gpu_batch?, host_batch?),
+            (None, None) => break,
+            _ => bail!("the GPU and CPU scans of the same file produced different batch counts"),
+        };
+
+        let gpu_record = gpu_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
+        let host_record = host_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
+        ensure!(
+            gpu_record.len() == host_record.len(),
+            "batch length differs between the GPU and CPU scans: {} vs {}",
+            gpu_record.len(),
+            host_record.len()
+        );
+
+        let gpu_fields = gpu_record
+            .iter_unmasked_fields()
+            .cloned()
+            .collect::<Vec<_>>();
+        let host_fields = host_record
+            .iter_unmasked_fields()
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure!(
+            gpu_fields.len() == host_fields.len(),
+            "field count differs between the GPU and CPU scans"
+        );
+
+        for (gpu_field, host_field) in gpu_fields.into_iter().zip(host_fields) {
+            let decoded = gpu_field.execute_cuda(&mut cuda_ctx).await?;
+            let decoded = decoded.into_host().await?.into_array();
+            verify_field(&host_field, decoded, cuda_ctx.execution_ctx())?;
+            fields_checked += 1;
+        }
+    }
+    cuda_ctx.synchronize_stream()?;
+
+    tracing::info!("verified {fields_checked} GPU-decoded Vortex fields against the CPU decode");
+    Ok(start.elapsed())
+}
+
 /// Fails unless a GPU-decoded field matches the same field decoded on the CPU.
-fn verify_field(compressed: &ArrayRef, gpu: ArrayRef, ctx: &mut ExecutionCtx) -> Result<()> {
-    let expected = SESSION
-        .arrow()
-        .execute_arrow(compressed.clone(), None, ctx)?;
+fn verify_field(host: &ArrayRef, gpu: ArrayRef, ctx: &mut ExecutionCtx) -> Result<()> {
+    let expected = SESSION.arrow().execute_arrow(host.clone(), None, ctx)?;
     // Pin the Arrow target type so the two sides cannot land on different but equivalent
     // encodings of the same logical values.
     let target = Field::new("", expected.data_type().clone(), gpu.dtype().is_nullable());
@@ -122,7 +185,7 @@ fn verify_field(compressed: &ArrayRef, gpu: ArrayRef, ctx: &mut ExecutionCtx) ->
     ensure!(
         expected.to_data() == actual.to_data(),
         "GPU decode of a {} field does not match the CPU decode",
-        compressed.encoding_id()
+        host.encoding_id()
     );
     Ok(())
 }
