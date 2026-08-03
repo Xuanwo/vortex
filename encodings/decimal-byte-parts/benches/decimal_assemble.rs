@@ -36,6 +36,20 @@
 //! to rot: cache blocking the lane passes over 1024-row blocks recovered part of the strided
 //! stores but was still 1.6x slower than the row loop, and expressing the passes as
 //! whole-value `i256` shifts was 11x slower.
+//!
+//! # Hand-written 64-bit words vs `u128` packing
+//!
+//! `i256::from_parts` takes a `u128` and an `i128`, so the assembly loops end each row with
+//! `u128::from(w0) | (u128::from(w1) << 64)`. The reflex is that this must be worse than
+//! storing four `u64`s by hand, because 128-bit integers lower badly. `i256_row_words` is
+//! that hand-written version, and it ties `i256_row_const` across runs.
+//!
+//! Disassembling the release build says why: neither shape emits a single `shld`/`shrd`, and
+//! both compile to four plain 64-bit stores per row at offsets 0x0/0x8/0x10/0x18. The `i128`
+//! loop is the same — `(i128::from(msp) << 64) | i128::from(part)` becomes two 64-bit stores.
+//! A shift by a constant multiple of 64 followed by an or is pure data movement, and LLVM
+//! recognizes it. The 128-bit codegen worth avoiding is division/remainder, which call into
+//! compiler-rt, and shifts by a runtime amount; neither appears here.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
@@ -62,6 +76,9 @@ fn main() {
 const LEN: usize = 65_536;
 
 const WORD_BITS: usize = 64;
+
+/// 64-bit words in the widest decimal value (`i256`).
+const MAX_VALUE_WORDS: usize = 4;
 
 /// Deterministic pseudo-random words, so no part is constant or a sequence.
 fn words(seed: u64, len: usize) -> Buffer<u64> {
@@ -179,6 +196,28 @@ fn i256_column_lanes(msp: &[i64], lower: [&[u64]; 3]) -> Buffer<i256> {
     Buffer::<i256>::from_byte_buffer_aligned(w.freeze().into_byte_buffer(), Alignment::of::<i256>())
 }
 
+/// The specialized row shape emitting raw 64-bit words: the output is built as a `u64` lane
+/// buffer and reinterpreted as `i256` at the end, so no 128-bit shift or or is ever written.
+///
+/// This exists to answer "shouldn't we avoid `u128` entirely, since LLVM handles 128-bit
+/// types badly?" — it does not, for this pattern. See the module docs.
+fn i256_row_words<const K: usize>(msp: &[i64], lower: [&[u64]; K]) -> Buffer<i256> {
+    let len = msp.len();
+    let mut w = BufferMut::<u64>::zeroed_aligned(len * MAX_VALUE_WORDS, Alignment::of::<i256>());
+    let lanes = w.as_mut_slice();
+    for (row, m) in msp.iter().enumerate() {
+        let mut words = [if *m < 0 { u64::MAX } else { 0 }; MAX_VALUE_WORDS];
+        for (i, part) in lower.iter().enumerate() {
+            words[K - 1 - i] = part[row];
+        }
+        words[K] = m.cast_unsigned();
+        lanes[row * MAX_VALUE_WORDS..(row + 1) * MAX_VALUE_WORDS].copy_from_slice(&words);
+    }
+    // Word order within an `i256` is ascending significance on a little-endian host.
+    assert!(cfg!(target_endian = "little"));
+    Buffer::<i256>::from_byte_buffer_aligned(w.freeze().into_byte_buffer(), Alignment::of::<i256>())
+}
+
 /// The specialized row shape for `i256`, writing into a pre-sized buffer.
 fn i256_row_write<const K: usize>(msp: &[i64], lower: [&[u64]; K]) -> Buffer<i256> {
     let mut out = BufferMut::<i256>::zeroed(msp.len());
@@ -287,6 +326,14 @@ fn i256_row_write_parts(bencher: Bencher) {
     let lower = parts.lower_slices();
     let lower = [lower[0], lower[1], lower[2]];
     bencher.bench(|| i256_row_write(black_box(parts.msp.as_slice()), black_box(lower)));
+}
+
+#[divan::bench]
+fn i256_row_words_parts(bencher: Bencher) {
+    let parts = Parts::new(3);
+    let lower = parts.lower_slices();
+    let lower = [lower[0], lower[1], lower[2]];
+    bencher.bench(|| i256_row_words(black_box(parts.msp.as_slice()), black_box(lower)));
 }
 
 #[divan::bench(args = [1, 3])]
