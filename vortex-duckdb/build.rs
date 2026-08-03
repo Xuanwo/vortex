@@ -23,7 +23,7 @@ const DUCKDB_RELEASES_URL: &str = "https://ci-builds.vortex.dev";
 
 const DUCKDB_SOURCE_RELEASE_URL: &str = "https://github.com/duckdb/duckdb/archive/refs/tags";
 const DUCKDB_SOURCE_COMMIT_URL: &str = "https://github.com/duckdb/duckdb/archive";
-const DEFAULT_DUCKDB_VERSION: &str = "1.5.5";
+const DEFAULT_DUCKDB_VERSION: &str = "b3062a5e82f50d77ff6e1006a36f645a79bc4936";
 
 const BUILD_ARTIFACTS: [&str; 3] = ["libduckdb.dylib", "libduckdb.so", "libduckdb_static.a"];
 const BUILD_MARKER: &str = ".vx-build-complete";
