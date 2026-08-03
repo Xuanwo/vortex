@@ -32,6 +32,13 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           enable-sccache: "true"
+      - name: Install DuckDB
+        # The Public BI datasets are converted from CSV to Parquet through the DuckDB CLI, as
+        # in bench-pr.yml. Without it those datasets fail to materialise their fixture.
+        run: |
+          wget -qO- https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip | funzip > duckdb
+          chmod +x duckdb
+          echo "$PWD" >> "$GITHUB_PATH"
       - uses: ./.github/actions/system-info
       - name: Display NVIDIA GPU details
         run: |
