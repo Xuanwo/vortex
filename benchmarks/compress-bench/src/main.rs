@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ use compress_bench::gpu_vortex::GpuVortexCompressor;
 use compress_bench::parquet::ParquetCompressor;
 use compress_bench::parquet_pages::GpuCodec;
 use compress_bench::vortex::VortexCompressor;
+use futures::FutureExt;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use regex::Regex;
@@ -286,17 +289,60 @@ async fn run_compress(
     let mut measurements = vec![];
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
+    // A verification pass reports on every dataset rather than stopping at the first failure:
+    // one run then says exactly which datasets decode correctly on the GPU and which do not.
+    let survey_all = gpu.is_some_and(|gpu| gpu.verify);
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+
     for dataset_handle in datasets.into_iter() {
-        let (m, mut records) =
-            run_benchmark_for_dataset(&progress, &formats, &ops, iterations, dataset_handle, gpu)
-                .await?;
-        measurements.push(m);
-        v3_records.append(&mut records);
+        let run =
+            run_benchmark_for_dataset(&progress, &formats, &ops, iterations, dataset_handle, gpu);
+
+        // Missing CUDA kernel support surfaces as a panic rather than an error, so the survey
+        // has to catch those too or the first unsupported dataset ends the run.
+        let result = if survey_all {
+            match AssertUnwindSafe(run).catch_unwind().await {
+                Ok(result) => result,
+                Err(panic) => Err(anyhow::anyhow!("panicked: {}", panic_message(&panic))),
+            }
+        } else {
+            run.await
+        };
+
+        match result {
+            Ok((m, mut records)) => {
+                measurements.push(m);
+                v3_records.append(&mut records);
+            }
+            Err(error) if survey_all => {
+                tracing::error!("{}: {error:#}", dataset_handle.name());
+                failures.push((dataset_handle.name().to_string(), error));
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let measurements = CompressMeasurements::from_iter(measurements);
 
     progress.finish();
+
+    if !failures.is_empty() {
+        eprintln!(
+            "\nGPU verification failed for {} dataset(s):",
+            failures.len()
+        );
+        for (dataset, error) in &failures {
+            eprintln!("  - {dataset}: {error:#}");
+        }
+        anyhow::bail!(
+            "GPU verification failed for: {}",
+            failures
+                .iter()
+                .map(|(dataset, _)| dataset.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     if let Some(path) = ingest_output {
         v3::write_jsonl_to_path(&path, &v3_records)?;
@@ -456,4 +502,15 @@ fn push_gpu_ratio(
         unit: std::borrow::Cow::from("ratio"),
         value: vortex_time.as_nanos() as f64 / parquet_time.as_nanos() as f64,
     });
+}
+
+/// Extracts the message from a caught panic payload.
+fn panic_message(panic: &Box<dyn Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
