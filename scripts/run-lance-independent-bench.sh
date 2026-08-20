@@ -42,17 +42,22 @@ build_benchmarks() {
     uv sync --project bench-orchestrator
 }
 
+run_compression_version() {
+    local version=$1
+    local formats=$2
+    local version_slug=${version/./_}
+    LANCE_FILE_VERSION=${version} run_timed "compression-v${version_slug}" \
+        bash scripts/bench-taskset.sh target/release_debug/compress-bench \
+        --formats "${formats}" --iterations 5 \
+        --display-format gh-json \
+        --output-path "${results_dir}/compression-v${version_slug}.json" \
+        --ingest-jsonl "${results_dir}/compression-v${version_slug}.ingest.jsonl"
+}
+
 run_compression() {
-    local version version_slug
-    for version in 2.0 2.1 2.3; do
-        version_slug=${version/./_}
-        LANCE_FILE_VERSION=${version} run_timed "compression-v${version_slug}" \
-            bash scripts/bench-taskset.sh target/release_debug/compress-bench \
-            --formats parquet,lance,vortex --iterations 5 \
-            --display-format gh-json \
-            --output-path "${results_dir}/compression-v${version_slug}.json" \
-            --ingest-jsonl "${results_dir}/compression-v${version_slug}.ingest.jsonl"
-    done
+    run_compression_version 2.0 parquet,lance,vortex
+    run_compression_version 2.1 lance
+    run_compression_version 2.3 lance
 }
 
 run_random_access() {
@@ -89,6 +94,12 @@ case "${phase}" in
         ;;
     compression)
         run_compression
+        ;;
+    compression-v2_1)
+        run_compression_version 2.1 lance
+        ;;
+    compression-v2_3)
+        run_compression_version 2.3 lance
         ;;
     random-access)
         run_random_access
