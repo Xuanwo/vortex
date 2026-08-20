@@ -8,7 +8,7 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 
 dnf install -y \
-    clang cmake curl gcc gcc-c++ git jq mdadm ninja-build numactl \
+    clang cmake gcc gcc-c++ git jq mdadm ninja-build numactl \
     openssl-devel pkgconf-pkg-config protobuf-compiler protobuf-devel \
     python3 python3-pip time unzip xfsprogs zstd
 
