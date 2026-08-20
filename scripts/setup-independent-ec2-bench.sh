@@ -9,7 +9,7 @@ fi
 
 dnf install -y \
     clang cmake gcc gcc-c++ git jq mdadm ninja-build numactl \
-    openssl-devel pkgconf-pkg-config python3 python3-pip time xfsprogs zstd
+    openssl-devel pkgconf-pkg-config protobuf-compiler python3 python3-pip time xfsprogs zstd
 
 mount_point=/mnt/bench
 if mountpoint -q "${mount_point}"; then
