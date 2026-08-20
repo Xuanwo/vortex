@@ -8,9 +8,17 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 
 dnf install -y \
-    clang cmake gcc gcc-c++ git jq mdadm ninja-build numactl \
+    clang cmake curl gcc gcc-c++ git jq mdadm ninja-build numactl \
     openssl-devel pkgconf-pkg-config protobuf-compiler protobuf-devel \
-    python3 python3-pip time xfsprogs zstd
+    python3 python3-pip time unzip xfsprogs zstd
+
+if ! command -v duckdb >/dev/null 2>&1; then
+    curl -fsSL \
+        https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
+        -o /tmp/duckdb-cli.zip
+    unzip -p /tmp/duckdb-cli.zip duckdb >/usr/local/bin/duckdb
+    chmod 0755 /usr/local/bin/duckdb
+fi
 
 mount_point=/mnt/bench
 if mountpoint -q "${mount_point}"; then
