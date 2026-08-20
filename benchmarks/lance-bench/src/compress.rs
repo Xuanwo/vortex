@@ -90,6 +90,18 @@ pub fn calculate_lance_size(dataset_path: &Path) -> anyhow::Result<u64> {
 /// uses temp directories. The compress method returns the total size of Lance files on disk.
 pub struct LanceCompressor;
 
+fn benchmark_file_version() -> anyhow::Result<LanceFileVersion> {
+    let value = std::env::var("LANCE_FILE_VERSION").unwrap_or_else(|_| "2.0".to_string());
+    match value.as_str() {
+        "2.0" | "V2_0" => Ok(LanceFileVersion::V2_0),
+        "2.1" | "V2_1" => Ok(LanceFileVersion::V2_1),
+        "2.3" | "V2_3" => Ok(LanceFileVersion::V2_3),
+        _ => Err(anyhow!(
+            "Unsupported LANCE_FILE_VERSION '{value}'; expected 2.0, 2.1, or 2.3"
+        )),
+    }
+}
+
 #[async_trait]
 impl Compressor for LanceCompressor {
     fn format(&self) -> Format {
@@ -124,7 +136,7 @@ impl Compressor for LanceCompressor {
             .ok_or_else(|| anyhow!("Failed to convert path to str"))?;
         let reader_iter =
             RecordBatchIterator::new(converted_batches.into_iter().map(Ok), converted_schema);
-        let write_params = WriteParams::with_storage_version(LanceFileVersion::V2_0);
+        let write_params = WriteParams::with_storage_version(benchmark_file_version()?);
         Dataset::write(reader_iter, path_str, Some(write_params)).await?;
 
         let elapsed = start.elapsed();
@@ -161,7 +173,7 @@ impl Compressor for LanceCompressor {
             .ok_or_else(|| anyhow!("Failed to convert path to str"))?;
         let reader_iter =
             RecordBatchIterator::new(converted_batches.into_iter().map(Ok), converted_schema);
-        let write_params = WriteParams::with_storage_version(LanceFileVersion::V2_0);
+        let write_params = WriteParams::with_storage_version(benchmark_file_version()?);
         Dataset::write(reader_iter, path_str, Some(write_params)).await?;
 
         // Now decompress
